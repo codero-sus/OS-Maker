@@ -308,9 +308,11 @@ class CommandAssemblyTests(unittest.TestCase):
                 (project / "config" / "includes.chroot" / "etc" / "hostname").read_text(encoding="utf-8"),
                 "studyos\n",
             )
-            self.assertTrue(
-                (project / "config" / "hooks" / "normal" / "0001-os-maker.hook.chroot").stat().st_mode & 0o111
-            )
+            if os.name != "nt":  # NTFS has no mode bits; the in-container chmod is what matters
+                self.assertTrue(
+                    (project / "config" / "hooks" / "normal" / "0001-os-maker.hook.chroot").stat().st_mode
+                    & 0o111
+                )
             self.assertEqual(
                 (project / "config" / "includes.chroot" / "etc" / "motd").read_text(encoding="utf-8"),
                 "hello from the host\n",
