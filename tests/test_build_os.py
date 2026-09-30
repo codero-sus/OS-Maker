@@ -290,7 +290,11 @@ class CommandAssemblyTests(unittest.TestCase):
             )
             hook_copy = staging / "hooks" / "0001-os-maker.hook.chroot"
             self.assertTrue(hook_copy.is_file())
-            self.assertTrue(os.access(hook_copy, os.X_OK))
+            # live-build only runs executable hooks, and host modes do not survive a
+            # Windows/macOS bind mount, so apply-staging.sh re-marks them in the container.
+            self.assertIn("chmod +x config/hooks/normal/*.hook.chroot", build_os.STAGING_SCRIPT)
+            if os.name != "nt":
+                self.assertTrue(os.access(hook_copy, os.X_OK), "hooks are executable on POSIX hosts")
 
             # emulate 'lb config' creating the config tree, then let the script do its job
             (project / "config").mkdir()
