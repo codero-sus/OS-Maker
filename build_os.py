@@ -9,6 +9,11 @@ with a SHA-256 checksum and the full build log -- into the output directory.
 
 It never touches the host operating system: everything happens in a scratch
 workspace that is removed again unless ``--keep-work`` is used.
+
+Structure: :func:`decide` validates the arguments into an immutable :class:`Plan`
+without executing anything, and :func:`run_build` then walks Workspace -> stage ->
+execute -> collect -> report.  Splitting it this way means a typo in a flag is
+rejected before a container starts, and each phase can be tested on its own.
 """
 
 from __future__ import annotations
