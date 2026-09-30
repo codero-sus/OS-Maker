@@ -10,6 +10,12 @@ Usage:
     python3 os_maker.py                        # interactive shell
     python3 os_maker.py -e "ls -l /" -e "date" # run commands and quit (scriptable)
     python3 os_maker.py --reset                # start from a fresh filesystem
+
+Structure: ``lex`` and ``parse`` turn a line into a command and its arguments,
+:class:`FileSystem` owns the node tree (path rules, contents, the JSON disk file) and
+:class:`TinyOS` is the shell on top of it -- expansion, aliases, dispatch, history,
+exit status.  ``boot``/``feed``/``interact``/``shutdown`` wire that to the command
+line, so a whole session can also be driven programmatically (or from a test).
 """
 
 from __future__ import annotations
@@ -789,7 +795,7 @@ class TinyOS:
     def cmd_mkdir(self, args: list[str]) -> str:
         flags, names = self.take_flags(args, "p")
         if not names:
-            raise ValueError("missing operand after 'mkdir'")
+            raise ValueError("missing operand")
         parents = "p" in flags
         for name in names:
             parent, leaf = self.resolve_parent(name, create_parents=parents)
@@ -804,38 +810,40 @@ class TinyOS:
 
     @command("rmdir <dir>...", "remove empty directories")
     def cmd_rmdir(self, args: list[str]) -> str:
-        if not args:
-            raise ValueError("missing operand after 'rmdir'")
-        for name in args:
+        names = self.operands(args, "rmdir")
+        if not names:
+            raise ValueError("missing operand")
+        for name in names:
             node, _, parent = self.resolve_detailed(name)
+            if parent is None:  # checked first: the root is not an entry to delete
+                raise PermissionError("rmdir: cannot remove '/'")
             if not is_dir(node):
                 raise NotADirectoryError(f"{self.expand(name)}: Not a directory")
             if children_of(node):
                 raise OSError(f"{self.expand(name)}: Directory not empty")
-            if parent is None:
-                raise PermissionError("rmdir: cannot remove '/'")
             self.remove(name)
         return ""
 
     @command("touch <file>...", "create empty files or update their timestamp")
     def cmd_touch(self, args: list[str]) -> str:
-        if not args:
-            raise ValueError("missing operand after 'touch'")
-        for name in args:
+        names = self.operands(args, "touch")
+        if not names:
+            raise ValueError("missing operand")
+        for name in names:
             self.touch(name)
         return ""
 
     @command("write <file> <text>", "replace the contents of a file")
     def cmd_write(self, args: list[str]) -> str:
         if len(args) < 2:
-            raise ValueError("write needs a file and the text to store")
+            raise ValueError("write: needs a file and the text to store")
         self.write_file(args[0], " ".join(args[1:]))
         return ""
 
     @command("append <file> <text>", "add a line to the end of a file")
     def cmd_append(self, args: list[str]) -> str:
         if len(args) < 2:
-            raise ValueError("append needs a file and the text to add")
+            raise ValueError("append: needs a file and the text to add")
         try:
             existing = self.read_text(args[0])
         except FileNotFoundError:
@@ -847,9 +855,10 @@ class TinyOS:
 
     @command("cat <file>...", "print file contents")
     def cmd_cat(self, args: list[str]) -> str:
-        if not args:
+        names = self.operands(args, "cat")
+        if not names:
             raise ValueError("cat: missing file operand")
-        chunks = [self.read_text(name) for name in args]
+        chunks = [self.read_text(name) for name in names]
         return "\n".join(chunk.rstrip("\n") for chunk in chunks if chunk.strip())
 
     @command("echo [-n] [text]", "print text (works with '>' and '>>' too)")
@@ -882,7 +891,7 @@ class TinyOS:
     def cmd_cp(self, args: list[str]) -> str:
         flags, names = self.take_flags(args, "rR")
         if len(names) < 2:
-            raise ValueError("cp needs at least a source and a destination")
+            raise ValueError("cp: needs at least a source and a destination")
         recursive = "r" in flags or "R" in flags
         destination = names[-1]
         target_node = self.resolve(destination) if self.exists(destination) else None
@@ -916,7 +925,7 @@ class TinyOS:
     @command("mv <source>... <destination>", "rename or move files")
     def cmd_mv(self, args: list[str]) -> str:
         if len(args) < 2:
-            raise ValueError("mv needs at least a source and a destination")
+            raise ValueError("mv: needs at least a source and a destination")
         destination = args[-1]
         target_node = self.resolve(destination) if self.exists(destination) else None
         into_dir = target_node is not None and is_dir(target_node)
@@ -952,8 +961,9 @@ class TinyOS:
 
     @command("tree [path]", "show the directory tree below a path")
     def cmd_tree(self, args: list[str]) -> str:
-        self.reject_extra(args, "tree", limit=1)
-        path = args[0] if args else "."
+        names = self.operands(args, "tree")
+        self.reject_extra(names, "tree", limit=1)
+        path = names[0] if names else "."
         node = self.resolve(path)
         if not is_dir(node):
             return f"{self.absolute(path)}: {node_size(node)}B"
@@ -982,10 +992,11 @@ class TinyOS:
 
     @command("stat <path>", "show metadata for a file or directory")
     def cmd_stat(self, args: list[str]) -> str:
-        if not args:
+        names = self.operands(args, "stat")
+        if not names:
             raise ValueError("stat: missing operand")
-        self.reject_extra(args, "stat", limit=1)
-        node = self.resolve(args[0])
+        self.reject_extra(names, "stat", limit=1)
+        node = self.resolve(names[0])
         return "\n".join(
             [
                 f"  File: {self.absolute(args[0])}",
@@ -1120,6 +1131,13 @@ class TinyOS:
     def reject_extra(args: Sequence[str], name: str, *, limit: int = 0) -> None:
         if len(args) > limit:
             raise ValueError(f"{name}: extra operand {args[limit]!r} (see 'man {name}')")
+
+    def operands(self, args: list[str], name: str, *, letters: str = "") -> list[str]:
+        """Operands for a command with few options; ``--`` ends them, unknown flags fail."""
+        try:
+            return self.take_flags(args, letters)[1]
+        except ValueError as exc:
+            raise ValueError(f"{name}: {exc}") from None
 
     @staticmethod
     def take_flags(args: Sequence[str], letters: str) -> tuple[str, list[str]]:

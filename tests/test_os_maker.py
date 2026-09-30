@@ -1018,5 +1018,114 @@ class EdgeCaseTests(unittest.TestCase):
         self.assertEqual(calls, [])  # a piped session never touches readline
 
 
+class UsageTests(unittest.TestCase):
+    """The contracts each built-in keeps when it is called wrongly."""
+
+    def setUp(self) -> None:
+        self.system = TinyOS()
+
+    def say(self, line: str) -> str:
+        return self.system.run(line)
+
+    def test_missing_operands_are_named(self) -> None:
+        cases = [
+            ("mkdir", "mkdir: missing operand"),
+            ("rmdir", "rmdir: missing operand"),
+            ("touch", "touch: missing operand"),
+            ("write", "write: needs a file and the text to store"),
+            ("append /tmp/x", "append: needs a file and the text to add"),
+            ("cat", "cat: missing file operand"),
+            ("rm", "rm: missing operand"),
+            ("cp /tmp/a", "cp: needs at least a source and a destination"),
+            ("mv /tmp/a", "mv: needs at least a source and a destination"),
+            ("stat", "stat: missing operand"),
+            ("edit", "edit: missing file operand"),
+        ]
+        for line, expected in cases:
+            with self.subTest(line=line):
+                self.assertEqual(self.say(line), expected)
+
+    def test_too_many_operands_are_refused(self) -> None:
+        self.assertEqual(self.say("pwd /tmp"), "pwd: extra operand '/tmp' (see 'man pwd')")
+        self.assertEqual(self.say("uname -x"), "uname: invalid option '-x'")
+        self.assertEqual(self.say("date now"), "date: extra operand 'now' (see 'man date')")
+
+    def test_cd_needs_a_previous_directory(self) -> None:
+        self.assertEqual(self.say("cd -"), "cd: OLDPWD not set")
+        self.assertEqual(self.say("cd /tmp"), "")
+        self.assertEqual(self.say("cd -"), "")
+        self.assertEqual(self.system.cwd, os_maker.HOME)
+
+    def test_mkdir_reports_collisions_and_accepts_dash_p(self) -> None:
+        self.assertEqual(self.say("mkdir /tmp/one"), "")
+        self.assertEqual(
+            self.say("mkdir /tmp/one"), "mkdir: /tmp/one: cannot create directory (already exists)"
+        )
+        self.assertEqual(self.say("mkdir -p /tmp/one"), "")  # -p never complains about an existing dir
+        self.assertEqual(self.say("mkdir -p /tmp/a/b/c"), "")
+        self.assertTrue(self.system.exists("/tmp/a/b/c"))
+        self.assertEqual(self.say("mkdir /nowhere/one"), "mkdir: /nowhere: No such file or directory")
+
+    def test_rmdir_is_pickier_than_rm(self) -> None:
+        self.assertEqual(self.say("rmdir /etc/hostname"), "rmdir: /etc/hostname: Not a directory")
+        self.assertEqual(self.say("mkdir /tmp/full"), "")
+        self.assertEqual(self.say("touch /tmp/full/x"), "")
+        self.assertEqual(self.say("rmdir /tmp/full"), "rmdir: /tmp/full: Directory not empty")
+        self.assertEqual(self.say("rm -r /tmp/full"), "")
+        self.assertEqual(self.say("rmdir /tmp/full"), "rmdir: /tmp/full: No such file or directory")
+        self.assertEqual(self.say("rmdir /"), "rmdir: cannot remove '/'")
+
+    def test_double_dash_ends_the_flags(self) -> None:
+        self.assertEqual(self.say("ls -- /tmp"), self.say("ls /tmp"))
+        self.assertEqual(self.say("cat -- /etc/hostname"), self.say("cat /etc/hostname"))
+        self.assertEqual(self.say("touch -x /tmp/a"), "touch: invalid option -- 'x'")
+        self.assertEqual(self.say("stat -x /etc"), "stat: invalid option -- 'x'")
+
+    def test_help_and_man_agree(self) -> None:
+        self.assertEqual(self.say("help ls"), self.say("man ls"))
+        self.assertEqual(self.say("man frobnicate"), "man: no manual entry for frobnicate")
+
+    def test_append_creates_then_extends(self) -> None:
+        self.assertEqual(self.say("append /tmp/log.txt first"), "")
+        self.assertEqual(self.say("append /tmp/log.txt second"), "")
+        self.assertEqual(self.system.read_text("/tmp/log.txt"), "first\nsecond")
+
+    def test_a_dirty_disk_reports_itself_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TinyOS(save_file=Path(tmp))  # a directory: never writable
+            with quiet() as out:
+                system.run("touch /a.txt")
+                self.assertTrue(system.dirty)
+                system.save()
+                system.save()
+                system.save()
+            self.assertEqual(out.getvalue().count("cannot save"), 1)
+            self.assertEqual(system.save_problems, 3)
+            self.assertTrue(system.dirty)  # nothing was written, so nothing was cleared
+
+    def test_readline_keeps_a_history_file_when_asked(self) -> None:
+        try:
+            import readline
+        except ImportError:
+            self.skipTest("no readline on this platform")
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            state.mkdir()
+            (state / "os-maker" / "history").parent.mkdir()
+            (state / "os-maker" / "history").write_text("earlier command\n", encoding="utf-8")
+            system = TinyOS()
+            with (
+                unittest.mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}),
+                quiet(),
+            ):
+                saver = os_maker.setup_readline(system, persist_history=True)
+                self.assertIsNotNone(saver)
+                self.addCleanup(readline.set_completer, None)
+                system.run("echo hello")
+                readline.add_history("echo hello")
+                saver()  # type: ignore[misc]
+            self.assertIn("echo hello", (state / "os-maker" / "history").read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
