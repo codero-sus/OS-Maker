@@ -80,10 +80,14 @@ jobs:
       - name: Run the suite under branch coverage
         run: python -m coverage run -m unittest discover -s tests -t .
       - name: Report
+        shell: bash
         run: |
-          python -m coverage report | tee coverage.txt
-          # the floor is a ratchet: raise it when the code gets better covered, never lower it
-          python -m coverage report --fail-under=85 --quiet
+          # The floor is a ratchet: raise it when coverage improves, never lower it.
+          set +e
+          python -m coverage report --fail-under=90 > coverage.txt 2>&1
+          status=$?
+          set -e
+          cat coverage.txt
           {
             echo "### Branch coverage"
             echo
@@ -91,6 +95,11 @@ jobs:
             tail -n 4 coverage.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" != "0" ]; then
+            # job logs are not always reachable, so put the numbers in an annotation
+            grep -E "TOTAL|failure|Error|error" coverage.txt | head -6 | sed 's/^/::error::/'
+            exit "$status"
+          fi
 
   native-build:
     name: Real ISO build (Docker)
