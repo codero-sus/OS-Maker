@@ -1108,6 +1108,8 @@ class UsageTests(unittest.TestCase):
             import readline
         except ImportError:
             self.skipTest("no readline on this platform")
+        if "libedit" in (readline.__doc__ or ""):
+            self.skipTest("macOS ships libedit, whose history file format differs")
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state"
             state.mkdir()
