@@ -285,7 +285,8 @@ class DockerCommandTests(FakeEngineTestCase):
         self.assertEqual(docker[:2], ["docker", "run"])
         self.assertIn("--privileged", docker)
         self.assertIn("-v", docker)
-        self.assertIn(f"{(self.root / 'work').as_posix()}:/work", docker)
+        expected_workspace = (self.root / "work").resolve().as_posix()  # main() resolves the path
+        self.assertIn(f"{expected_workspace}:/work", docker)
         self.assertEqual(docker[docker.index("-w") + 1], "/work/live-os")
         self.assertEqual(docker[docker.index("-w") + 2], "debian:bookworm-slim")
         script = docker[-1]
