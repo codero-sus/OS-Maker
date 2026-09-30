@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build artefacts (regenerate with: python3 build_os.py --name MyOS)
+dist/
+build-work/
+*.iso
+*.iso.sha256
+*.iso.log
+
+# OS Maker simulator state
+os_maker_data.json
+os_maker_data.json.tmp
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# OS noise
+.DS_Store
+Thumbs.db
