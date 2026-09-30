@@ -7,11 +7,17 @@ Run from the repository root::
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
+from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -522,6 +528,494 @@ class CommandLineTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("hi", completed.stdout)
+
+
+@contextlib.contextmanager
+def quiet() -> Iterator[io.StringIO]:
+    """Swallow (and hand back) everything the shell prints."""
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        yield buffer
+
+
+class DiskTests(unittest.TestCase):
+    """The filesystem layer on its own: paths, contents and the save file."""
+
+    def setUp(self) -> None:
+        self.fs = os_maker.FileSystem()
+
+    def test_paths_are_normalised_without_a_shell(self) -> None:
+        self.assertEqual(self.fs.split("/etc/../var"), ["var"])
+        self.assertEqual(self.fs.split("/"), [])
+        self.assertEqual(self.fs.split("."), ["home", "guest"])  # relative to the cwd
+        self.assertEqual(self.fs.absolute("/a/../b"), "/b")
+        self.assertEqual(self.fs.path_of([]), "/")
+        self.assertEqual(self.fs.path_of(["a", "b"]), "/a/b")
+
+    def test_dollars_are_ordinary_characters_here(self) -> None:
+        # expansion is the shell's job, so the disk must not reinterpret what it is given
+        self.fs.write_file("/tmp/$HOME.txt", "kept")
+        self.assertEqual(self.fs.split("/tmp/$HOME.txt"), ["tmp", "$HOME.txt"])
+        self.assertEqual(self.fs.read_text("/tmp/$HOME.txt"), "kept")
+
+    def test_chdir_moves_and_remembers_the_previous_directory(self) -> None:
+        self.fs.chdir("/tmp")
+        self.assertEqual((self.fs.cwd, self.fs.old_cwd), ("/tmp", "/home/guest"))
+        self.fs.chdir("/")
+        self.assertEqual(self.fs.cwd, "/")
+        self.assertEqual(self.fs.split(".."), [])  # ".." above the root is the root itself
+
+    def test_chdir_reports_why_it_refused(self) -> None:
+        with self.assertRaises(NotADirectoryError) as caught:
+            self.fs.chdir("/etc/hostname")
+        self.assertIn("Not a directory", str(caught.exception))
+        with self.assertRaises(FileNotFoundError):
+            self.fs.chdir("/nope")
+
+    def test_lookup_errors_name_the_offending_component(self) -> None:
+        with self.assertRaises(NotADirectoryError) as caught:
+            self.fs.resolve("/etc/hostname/passwd")
+        self.assertIn("/etc/hostname", str(caught.exception))
+        with self.assertRaises(FileNotFoundError) as caught:
+            self.fs.resolve("/etc/nope/deeper")
+        self.assertIn("/etc/nope", str(caught.exception))
+
+    def test_the_root_directory_is_not_an_entry(self) -> None:
+        with self.assertRaises(PermissionError) as caught:
+            self.fs.resolve_parent("/")
+        self.assertIn("cannot modify the root directory", str(caught.exception))
+
+    def test_names_are_limited_to_255_bytes(self) -> None:
+        with self.assertRaises(OSError) as caught:
+            self.fs.touch("/tmp/" + "x" * (os_maker.MAX_NAME_LENGTH + 1))
+        self.assertIn("File name too long", str(caught.exception))
+
+    def test_touch_creates_then_updates(self) -> None:
+        self.fs.touch("/tmp/late.txt")
+        first = self.fs.resolve("/tmp/late.txt")["mtime"]
+        self.fs.touch("/tmp/late.txt")
+        self.assertGreaterEqual(self.fs.resolve("/tmp/late.txt")["mtime"], first)
+        with self.assertRaises(IsADirectoryError):
+            self.fs.touch("/etc")
+
+    def test_read_and_write_refuse_the_wrong_kind_of_node(self) -> None:
+        with self.assertRaises(IsADirectoryError):
+            self.fs.read_text("/etc")
+        self.fs.write_file("/tmp/plain.txt", "hi")
+        with self.assertRaises(NotADirectoryError):
+            self.fs.write_file("/tmp/plain.txt/deeper", "no")
+        self.assertTrue(self.fs.is_directory("/etc"))
+        self.assertFalse(self.fs.is_directory("/tmp/plain.txt"))
+
+    def test_missing_parents_are_only_created_when_asked(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            self.fs.resolve_parent("/tmp/deep/deeper/file")
+        self.assertFalse(self.fs.exists("/tmp/deep"))
+        parent, leaf = self.fs.resolve_parent("/tmp/deep/deeper/file", create_parents=True)
+        self.assertEqual(leaf, "file")
+        self.assertEqual(parent["children"], {})  # the leaf itself is still for the caller to make
+        self.assertTrue(self.fs.is_directory("/tmp/deep/deeper"))
+
+    def test_remove_drops_an_entry(self) -> None:
+        self.fs.write_file("/tmp/gone.txt", "x")
+        self.fs.remove("/tmp/gone.txt")
+        self.assertFalse(self.fs.exists("/tmp/gone.txt"))
+
+    def test_is_inside_only_reports_strict_descendants(self) -> None:
+        self.assertFalse(self.fs.is_inside("/tmp", "/tmp"))
+        self.assertTrue(self.fs.is_inside("/tmp/sub", "/tmp"))
+        self.assertTrue(self.fs.is_inside("/tmp/a/b", "/tmp/a"))
+        self.assertFalse(self.fs.is_inside("/etc", "/tmp"))
+        self.assertTrue(self.fs.exists("/tmp"))
+        self.assertFalse(self.fs.exists("/tmp/nothing-here"))
+
+    def test_saving_is_optional_and_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            disk_file = Path(tmp) / "disk.json"
+            fs = os_maker.FileSystem(save_file=disk_file)
+            fs.save()  # nothing dirty yet: no write, no fuss
+            self.assertFalse(disk_file.exists())
+            fs.write_file("/home/guest/note.txt", "kept")
+            fs.save()
+            self.assertEqual({entry.name for entry in Path(tmp).iterdir()}, {"disk.json"})
+            reloaded, problem = os_maker.FileSystem.open(disk_file)
+            self.assertIsNone(problem)
+            self.assertEqual(reloaded.read_text("/home/guest/note.txt"), "kept")
+
+    def test_a_broken_disk_boots_anyway_and_says_why(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            disk_file = Path(tmp) / "disk.json"
+            disk_file.write_text("{ not json", encoding="utf-8")
+            fs, problem = os_maker.FileSystem.open(disk_file)
+            self.assertIn("is not a valid virtual disk", problem or "")
+            self.assertEqual(fs.cwd, os_maker.HOME)
+            fs.write_file("/tmp/x", "y")
+            fs.save()  # saving repairs the disk, so the session is not wasted
+            self.assertIn("y", disk_file.read_text(encoding="utf-8"))
+
+    def test_an_unwritable_disk_is_reported_not_raised(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fs = os_maker.FileSystem(save_file=Path(tmp))  # a directory is not a file
+            fs.write_file("/tmp/x", "y")
+            self.assertIn("cannot save", fs.save() or "")
+            self.assertEqual(fs.save_problems, 1)
+            self.assertIn("cannot save", fs.save() or "")  # still reporting, still alive
+            self.assertEqual(list(Path(tmp).iterdir()), [], "no half-written file is left behind")
+
+    def test_open_without_a_file_starts_fresh(self) -> None:
+        fs, problem = os_maker.FileSystem.open(None)
+        self.assertIsNone(problem)
+        self.assertTrue(fs.exists("/etc/os-release"))
+
+
+class SessionTests(unittest.TestCase):
+    """boot / feed / interact / shutdown, driven in-process so the tests see the code."""
+
+    def test_boot_gives_a_clean_system(self) -> None:
+        system, problem = os_maker.boot(save_file=None)
+        self.assertIsNone(problem)
+        self.assertEqual(system.hostname, "osmaker")
+        self.assertEqual(system.cwd, os_maker.HOME)
+        self.assertEqual(system.exit_code, 0)
+        self.assertFalse(system.should_exit)
+        self.assertIsNone(system.save_problems or None)
+
+    def test_boot_reports_a_disk_it_cannot_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = Path(tmp) / "disk.json"
+            broken.mkdir()  # something is in the way where the disk should live
+            system, problem = os_maker.boot(save_file=broken)
+        self.assertIn("could not read", problem or "")
+        self.assertEqual(system.run("echo still working"), "still working")
+
+    def test_feed_runs_each_line_and_saves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            disk_file = Path(tmp) / "disk.json"
+            system, _ = os_maker.boot(save_file=disk_file)
+            with quiet() as out:
+                status = system.feed(["write /tmp/notes.txt hello", "cat /tmp/notes.txt"])
+            self.assertEqual(status, 0)
+            self.assertEqual(out.getvalue().strip(), "hello")
+            reloaded, problem = os_maker.load_fs(disk_file)
+            self.assertIsNone(problem)
+            self.assertIn("hello", TinyOS(reloaded).read_text("/tmp/notes.txt"))
+
+    def test_feed_stops_at_exit_and_keeps_its_status(self) -> None:
+        system, _ = os_maker.boot()
+        with quiet() as out:
+            status = system.feed(["echo first", "exit 3", "echo never"])
+        self.assertEqual(status, 3)
+        self.assertEqual(out.getvalue().strip(), "first")
+
+    def test_feed_reports_a_broken_command_without_raising(self) -> None:
+        system, _ = os_maker.boot()
+        with quiet() as out:
+            system.feed(["nosuchcommand", "cat /etc/nope"])
+        text = out.getvalue()
+        self.assertIn("command not found", text)
+        self.assertIn("No such file", text)
+
+    def test_interact_reads_until_the_input_runs_out(self) -> None:
+        answers = iter(["uname", "hostname myos"])
+        system = TinyOS(read_line=lambda prompt: next(answers, None))
+        with quiet() as out:
+            self.assertEqual(system.interact(), 0)
+        text = out.getvalue()
+        self.assertIn("OSMaker", text)
+        self.assertEqual(system.hostname, "myos")
+
+    def test_interact_treats_a_none_line_as_end_of_input(self) -> None:
+        system = TinyOS(read_line=lambda prompt: None)
+        with quiet() as out:
+            self.assertEqual(system.interact(), 0)
+        self.assertEqual(out.getvalue(), "\n")  # end of input, cleanly
+
+    def test_interact_recovers_from_ctrl_c(self) -> None:
+        answers = iter([KeyboardInterrupt(), "echo alive"])
+
+        def reader(_prompt: str) -> str | None:
+            value = next(answers, None)  # exhausted input means end of session
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        system = TinyOS(read_line=reader)
+        with quiet() as out:
+            self.assertEqual(system.interact(), 0)
+        self.assertIn("^C", out.getvalue())
+        self.assertIn("alive", out.getvalue())
+        self.assertEqual(system.exit_code, 0)  # the line that ran afterwards reset it
+
+    def test_the_shell_reads_input_by_default(self) -> None:
+        system = TinyOS()  # no injected reader: the real input() is used
+        with unittest.mock.patch("builtins.input", return_value="echo piped"):
+            self.assertEqual(system.read_input("prompt"), "echo piped")
+
+    def test_shutdown_says_what_happened_to_the_disk(self) -> None:
+        system, _ = os_maker.boot(save_file=None)
+        self.assertIn("nothing was saved", os_maker.shutdown(system))
+        with tempfile.TemporaryDirectory() as tmp:
+            disk_file = Path(tmp) / "disk.json"
+            system, _ = os_maker.boot(save_file=disk_file)
+            system.run("write /keep.txt yes")
+            self.assertIn("has been saved", os_maker.shutdown(system))
+            self.assertTrue(disk_file.is_file())
+
+            broken, _ = os_maker.boot(save_file=Path(tmp))  # a directory: unwritable
+            broken.run("write /more.txt nope")
+            with quiet():
+                self.assertIn("could not be written", os_maker.shutdown(broken))
+
+    def test_shutdown_leaves_a_disk_behind_after_a_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            disk_file = Path(tmp) / "disk.json"  # does not exist yet: --reset just removed it
+            system, _ = os_maker.boot(save_file=disk_file)
+            self.assertIn("has been saved", os_maker.shutdown(system))
+            self.assertIn("os-release", disk_file.read_text(encoding="utf-8"))
+
+    def test_edit_uses_the_injected_reader(self) -> None:
+        answers = iter(["one", "two", "."])
+        system = TinyOS(read_line=lambda prompt: next(answers))
+        self.assertEqual(system.run("edit /tmp/lines.txt"), "wrote 2 lines to /tmp/lines.txt")
+        self.assertEqual(system.read_text("/tmp/lines.txt"), "one\ntwo\n")
+
+    def test_edit_without_a_terminal_suggests_write(self) -> None:
+        system = TinyOS()
+        system.read_line = None
+        self.assertEqual(
+            system.run("edit /tmp/x"), "edit: no terminal to read from (use 'write <file> <text>' instead)"
+        )
+
+    def test_edit_starts_from_the_existing_lines(self) -> None:
+        system = TinyOS()
+        system.run("write /tmp/notes.txt old line")
+        answers = iter(["fresh", None])
+        system.read_line = lambda prompt: next(answers)
+        self.assertIn("wrote 2 lines", system.run("edit /tmp/notes.txt"))
+        self.assertEqual(system.read_text("/tmp/notes.txt"), "old line\nfresh\n")
+
+    def test_the_banner_names_the_version_the_user_and_the_place(self) -> None:
+        system, _ = os_maker.boot()
+        text = os_maker.banner(system)
+        self.assertIn("M A K E R", text)
+        self.assertIn(os_maker.VERSION, text)
+        self.assertIn("guest@osmaker", text)
+        self.assertIn("cwd ~", text)
+        self.assertIn("Type 'help'", text)
+        system.unicode_output = False
+        self.assertIn("O S   M A K E R", os_maker.banner(system))
+
+    def test_prompt_shows_the_working_directory(self) -> None:
+        system, _ = os_maker.boot()
+        self.assertIn("guest@osmaker", os_maker.prompt_for(system))
+        self.assertTrue(os_maker.prompt_for(system).endswith(":~$ "))
+        system.run("cd /etc")
+        self.assertIn("guest@osmaker:/etc$ ", os_maker.prompt_for(system))
+        self.assertEqual(os_maker.display_cwd(system), "/etc")
+
+    def test_unicode_support_follows_the_stream_encoding(self) -> None:
+        for encoding, expected in (
+            ("utf-8", True),
+            ("UTF-8", True),
+            ("ascii", False),
+            ("", False),
+            ("nope-9", False),
+        ):
+            self.assertEqual(
+                os_maker.supports_unicode(SimpleNamespace(encoding=encoding)), expected, encoding
+            )
+
+    def test_unknown_and_malformed_lines_set_the_status(self) -> None:
+        system, _ = os_maker.boot()
+        with quiet():
+            system.run("frobnicate")
+            self.assertEqual(system.exit_code, 127)
+            system.run("echo 'unbalanced")
+            self.assertEqual(system.exit_code, 2)
+            system.run("cat /etc/missing")
+            self.assertEqual(system.exit_code, 1)
+            self.assertEqual(system.run("# just a comment"), "")
+            self.assertEqual(system.exit_code, 1)  # a comment runs nothing, so $? survives
+
+    def test_flags_are_strict_about_options(self) -> None:
+        system, _ = os_maker.boot()
+        self.assertEqual(system.run("ls -Q"), "ls: invalid option -- 'Q'")
+        self.assertEqual(system.run("ls --colour"), "ls: unrecognized option '--colour'")
+        self.assertEqual(system.run("du /etc /var"), "du: extra operand '/var' (see 'man du')")
+
+    def test_history_records_what_was_run(self) -> None:
+        system, _ = os_maker.boot()
+        with quiet():
+            system.run("echo hi")
+            system.run("   ")  # blank lines are not history
+        self.assertEqual(system.history, ["echo hi"])
+
+    def test_main_can_be_driven_without_a_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            disk_file = Path(tmp) / "disk.json"
+            with quiet() as first:
+                self.assertEqual(
+                    os_maker.main(["--no-banner", "--save-file", str(disk_file), "-e", "write /m.txt hi"]), 0
+                )
+            self.assertIn("has been saved", first.getvalue())
+            with quiet() as second:
+                self.assertEqual(
+                    os_maker.main(["--no-banner", "--save-file", str(disk_file), "-e", "cat /m.txt"]), 0
+                )
+            self.assertIn("hi", second.getvalue())
+            with quiet() as reset:
+                self.assertEqual(
+                    os_maker.main(
+                        ["--no-banner", "--reset", "--save-file", str(disk_file), "-e", "cat /m.txt"]
+                    ),
+                    1,  # the disk was discarded, so the shell reports the missing file
+                )
+            self.assertIn("No such file", reset.getvalue())
+
+    def test_main_passes_a_command_status_through(self) -> None:
+        with quiet():
+            self.assertEqual(os_maker.main(["--no-banner", "--no-save", "-e", "exit 7"]), 7)
+
+    def test_main_warns_about_a_disk_it_cannot_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, quiet() as out:
+            self.assertEqual(os_maker.main(["--no-banner", "--save-file", tmp, "-e", "touch /x"]), 0)
+        self.assertIn("could not be written", out.getvalue())
+
+    def test_parser_defaults(self) -> None:
+        args = os_maker.build_parser().parse_args([])
+        self.assertEqual(args.execute, [])
+        self.assertFalse(args.no_save)
+        self.assertFalse(args.reset)
+        self.assertFalse(args.no_banner)
+        self.assertFalse(args.ascii)
+        self.assertIsNone(args.save_file)
+        with self.assertRaises(SystemExit):
+            os_maker.build_parser().parse_args(["--version"])
+
+    def test_readline_is_optional_but_never_breaks_a_session(self) -> None:
+        try:
+            import readline
+        except ImportError:
+            self.skipTest("no readline on this platform")
+        system, _ = os_maker.boot()
+        system.run("echo seeded")
+        with quiet():
+            saver = os_maker.setup_readline(system, persist_history=False)
+        self.addCleanup(readline.set_completer, None)
+        completer = readline.get_completer()
+        self.assertIsNotNone(completer)
+        self.assertTrue(completer("ca", 0).startswith("cat"))
+        if saver is not None:
+            saver()  # persist_history=False must not write anything to the home directory
+
+
+class EdgeCaseTests(unittest.TestCase):
+    """The odd corners: malformed disks, quoting, colours and a hostile filesystem."""
+
+    def test_a_malformed_disk_is_rejected_with_a_useful_reason(self) -> None:
+        cases = [
+            ({"type": "dir"}, "directory without a children map"),
+            ({"type": "file", "content": 7}, "file content must be a string"),
+            ({"type": "symlink"}, "unknown node type"),
+            ({"type": "dir", "children": {"": {}}}, "invalid entry name"),
+            ({"type": "dir", "children": {"a/b": {}}}, "invalid entry name"),
+            ({"type": "dir", "children": {"x" * 300: {}}}, "entry name too long"),
+            ({"type": "dir", "children": {"a": {"type": "bogus"}}}, "unknown node type"),
+        ]
+        for root, fragment in cases:
+            with self.subTest(root=str(root)[:40]):
+                with self.assertRaises(ValueError) as caught:
+                    os_maker.validate_fs(root)
+                self.assertIn(fragment, str(caught.exception))
+
+    def test_load_fs_reports_a_tree_it_cannot_use(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            disk_file = Path(tmp) / "disk.json"
+            disk_file.write_text('{"type": "dir", "children": {"a": {}}}', encoding="utf-8")
+            root, problem = os_maker.load_fs(disk_file)
+            self.assertIsNotNone(problem)
+            self.assertEqual(root["type"], "dir")  # a usable disk was handed back anyway
+
+    def test_quoting_and_escapes(self) -> None:
+        self.assertEqual(
+            [token.value for token in os_maker.lex("echo \"a b\" 'c $d' e\\ f")],
+            ["echo", "a b", "c $d", "e f"],
+        )
+        self.assertEqual([token.value for token in os_maker.lex('echo "say \\"hi\\""')], ["echo", 'say "hi"'])
+        with self.assertRaises(os_maker.ShellSyntaxError):
+            os_maker.lex("echo 'unterminated")
+        self.assertIsNone(parse(os_maker.lex("")))
+
+    def test_the_hostname_only_sticks_if_it_is_legal(self) -> None:
+        for stored, expected in (("desk-01", "desk-01"), ("Not Legal", "osmaker"), ("", "osmaker")):
+            with self.subTest(stored=stored):
+                root = os_maker.fresh_fs()
+                root["children"]["etc"]["children"]["hostname"] = os_maker.make_file(stored + "\n")
+                if not stored:
+                    del root["children"]["etc"]["children"]["hostname"]
+                self.assertEqual(TinyOS(root).hostname, expected)
+
+    def test_the_message_of_the_day_shows_up_in_the_banner(self) -> None:
+        system = TinyOS()
+        system.run("write /etc/motd Read the manual first.")
+        self.assertIn("Read the manual first.", os_maker.banner(system))
+
+    def test_the_prompt_is_coloured_on_a_terminal(self) -> None:
+        system = TinyOS()
+        system.unicode_output = True
+        with (
+            unittest.mock.patch("sys.stdout.isatty", return_value=True),
+            unittest.mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            self.assertIn("\033[1;32m", os_maker.prompt_for(system))
+        with (
+            unittest.mock.patch("sys.stdout.isatty", return_value=True),
+            unittest.mock.patch.dict(os.environ, {"NO_COLOR": "1"}),
+        ):
+            self.assertNotIn("\033", os_maker.prompt_for(system))
+
+    def test_display_cwd_falls_back_to_the_absolute_path(self) -> None:
+        system = TinyOS()
+        system.run("cd /var")
+        self.assertEqual(os_maker.display_cwd(system), "/var")
+
+    def test_main_gives_up_when_the_disk_cannot_be_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            disk_file = Path(tmp) / "disk.json"
+            disk_file.write_text("{}", encoding="utf-8")
+            with (
+                unittest.mock.patch.object(Path, "unlink", side_effect=OSError("busy")),
+                quiet() as out,
+            ):
+                self.assertEqual(
+                    os_maker.main(["--reset", "--save-file", str(disk_file), "-e", "echo hi"]), 1
+                )
+        self.assertIn("could not reset", out.getvalue())
+
+    def test_main_sets_up_line_editing_only_for_a_terminal(self) -> None:
+        calls: list[bool] = []
+
+        def spy(_system: TinyOS, *, persist_history: bool) -> None:
+            calls.append(persist_history)
+
+        system = TinyOS(read_line=lambda _prompt: None)
+        with (
+            unittest.mock.patch.object(os_maker, "setup_readline", spy),
+            unittest.mock.patch("sys.stdin.isatty", return_value=True),
+            unittest.mock.patch.object(os_maker, "boot", return_value=(system, None)),
+            quiet(),
+        ):
+            self.assertEqual(os_maker.main(["--no-banner", "--no-save"]), 0)
+        self.assertEqual(calls, [False])  # interactive, and --no-save keeps the history file alone
+
+        calls.clear()
+        with (
+            unittest.mock.patch.object(os_maker, "setup_readline", spy),
+            unittest.mock.patch("sys.stdin.isatty", return_value=False),
+            quiet(),
+        ):
+            self.assertEqual(os_maker.main(["--no-banner", "--no-save", "-e", "echo hi"]), 0)
+        self.assertEqual(calls, [])  # a piped session never touches readline
 
 
 if __name__ == "__main__":
