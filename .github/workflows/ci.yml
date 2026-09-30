@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint and format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade "ruff>=0.6"
+      - run: ruff check build_os.py os_maker.py tests
+      - run: ruff format --check build_os.py os_maker.py tests
+
+  test:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Byte-compile both scripts
+        run: python -m compileall -q build_os.py os_maker.py
+      - name: Unit and integration tests
+        run: python -m unittest discover -s tests -t . -v
+      - name: Shell smoke test (simulator end to end)
+        run: >
+          python os_maker.py --no-save --no-banner
+          -e "mkdir -p /tmp/demo"
+          -e "write /tmp/demo/notes.txt hello from CI"
+          -e "cat /tmp/demo/notes.txt"
+          -e "tree /tmp/demo"
+          -e "df"
+      - name: Builder dry run (no Docker required)
+        run: >
+          python build_os.py --name "CI Test OS" --release trixie --architecture arm64
+          --packages sudo,neofetch --compression zstd --dry-run
+
+  native-build:
+    name: Real ISO build (Docker)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install QEMU (used to boot-test the result)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+      # One build only: --boot-test boots the finished ISO headless and fails the
+      # job unless the live system reaches its login prompt.
+      - name: Build a minimal live ISO and boot it
+        run: |
+          python build_os.py --name "CI Minimal" --packages "linux-image-amd64,live-boot,sudo" \
+            --compression lz4 --cache-dir "${{ runner.temp }}/apt-cache" \
+            --output dist --boot-test --boot-timeout 420
+      - name: Record the image checksum in the job summary
+        if: always()
+        run: |
+          {
+            echo "## Built image"
+            ls -l dist/ || true
+            echo '```'
+            (cd dist && sha256sum *.iso 2>/dev/null || echo "no ISO produced")
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

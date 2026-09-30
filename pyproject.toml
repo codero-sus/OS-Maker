@@ -1,0 +1,13 @@
+# OS Maker is two standalone scripts (build_os.py and os_maker.py) with no runtime
+# dependencies, so there is nothing to install -- this file only holds tool config.
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "I", "B", "UP", "SIM", "C4", "RET", "ARG", "PIE", "RUF"]
+# Long help/usage strings read better unwrapped, and ruff format owns the layout.
+ignore = ["E501", "RUF001", "RUF002", "RUF003", "RET504"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG005"]
