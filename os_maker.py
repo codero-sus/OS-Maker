@@ -24,7 +24,7 @@ import platform
 import re
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -93,7 +93,7 @@ def ensure_path(root: dict[str, Any], path: str) -> dict[str, Any]:
         if part in ("/", ""):
             continue
         node = node["children"].setdefault(part, make_dir())
-        if node.get("type") != "dir":  # pragma: no cover - only for hand-edited disks
+        if not is_dir(node):  # pragma: no cover - only for hand-edited disks
             raise OSError(f"{path}: a file is in the way")
     return node
 
@@ -131,30 +131,52 @@ def validate_fs(node: Any, path: str = "/") -> None:
         raise ValueError(f"{path}: unknown node type {kind!r}")
 
 
+def is_dir(node: Any) -> bool:
+    """True for a directory node (the two node kinds are the whole data model)."""
+    return isinstance(node, dict) and node.get("type") == "dir"
+
+
+def is_file(node: Any) -> bool:
+    return isinstance(node, dict) and node.get("type") == "file"
+
+
+def children_of(node: Any) -> dict[str, Any]:
+    """The entries of a directory node (empty for anything else)."""
+    if not isinstance(node, dict):
+        return {}
+    children = node.get("children")
+    return children if isinstance(children, dict) else {}
+
+
+def mtime_of(node: Any, fallback: int) -> int:
+    stamp = node.get("mtime") if isinstance(node, dict) else None
+    return stamp if isinstance(stamp, int) else fallback
+
+
 def node_size(node: dict[str, Any]) -> int:
-    if node.get("type") != "file":
+    if not is_file(node):
         return 4096
     return len(node.get("content", "").encode("utf-8"))
 
 
 def content_size(node: dict[str, Any]) -> int:
-    if node.get("type") == "file":
+    if is_file(node):
         return len(node.get("content", "").encode("utf-8"))
-    return sum(content_size(child) for child in node.get("children", {}).values())
+    return sum(content_size(child) for child in children_of(node).values())
 
 
 def node_blocks(node: dict[str, Any]) -> int:
     """Blocks used by a node; every file takes at least one, like a real filesystem."""
-    if node.get("type") != "file":
-        return sum(node_blocks(child) for child in node.get("children", {}).values())
+    if not is_file(node):
+        return sum(node_blocks(child) for child in children_of(node).values())
     size = len(node.get("content", "").encode("utf-8"))
     return max(1, -(-size // BLOCK_SIZE))
 
 
 def link_count(node: dict[str, Any]) -> int:
-    if node.get("type") != "dir":
+    if not is_dir(node):
         return 1
-    return 2 + sum(1 for child in node.get("children", {}).values() if child.get("type") == "dir")
+    return 2 + sum(1 for child in children_of(node).values() if is_dir(child))
 
 
 def format_time(stamp: int) -> str:
@@ -259,83 +281,60 @@ def parse(tokens: Sequence[Token]) -> ParsedLine | None:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class CommandInfo:
+    """A built-in: how to call it, what it does, and the function that does it."""
+
     name: str
     usage: str
     summary: str
+    run: Callable[[TinyOS, list[str]], str]
 
 
 COMMANDS: dict[str, CommandInfo] = {}
 ALIASES: dict[str, str] = {"ll": "ls -l", "dir": "ls", "cls": "clear", "logout": "exit"}
 
 
-def command(usage: str, summary: str) -> Callable:
-    """Register a built-in and document it in the same place (help/man read this)."""
+def command(
+    usage: str, summary: str
+) -> Callable[[Callable[[TinyOS, list[str]], str]], Callable[[TinyOS, list[str]], str]]:
+    """Register a built-in and document it in the same place (help/man read this).
 
-    def decorator(function: Callable[[TinyOS, list[str]], str]) -> Callable:
-        COMMANDS[function.__name__[4:]] = CommandInfo(function.__name__[4:], usage, summary)
+    Dispatch goes through this registry rather than ``getattr(self, "cmd_" + name)``,
+    so a method that is not meant to be a command can never become one.
+    """
+
+    def decorator(function: Callable[[TinyOS, list[str]], str]) -> Callable[[TinyOS, list[str]], str]:
+        name = function.__name__[4:]
+        COMMANDS[name] = CommandInfo(name, usage, summary, function)
         return function
 
     return decorator
 
 
-class TinyOS:
-    """The virtual machine: an in-memory filesystem, a working directory and the built-ins."""
+class FileSystem:
+    """The virtual disk: a node tree, the current directory and the save file.
+
+    Deliberately shell-free -- every path it is handed has already been expanded,
+    so the tree can be used (and tested) on its own.  Errors are :class:`OSError`
+    subclasses with the path first, the way coreutils phrase them.
+    """
 
     def __init__(
         self,
         root: dict[str, Any] | None = None,
         *,
         save_file: Path | None = None,
-        read_line: Callable[[str], str | None] | None = None,
+        cwd: str = HOME,
     ):
         self.root = root or fresh_fs()
-        self.cwd = HOME
-        self.old_cwd: str | None = None
-        self.history: list[str] = []
         self.save_file = save_file
-        self.read_line = read_line
+        self.cwd = cwd
+        self.old_cwd: str | None = None
         self.dirty = False
         self.save_problems = 0
-        self.should_exit = False
-        self.exit_code = 0
-        self.unicode_output = True
-        self.boot_time = now()
-        self.hostname = "osmaker"  # replaced from /etc/hostname below, once expansion works
-        try:
-            raw_hostname = self.read_text("/etc/hostname").strip()
-        except OSError:
-            raw_hostname = ""
-        if HOSTNAME_RE.match(raw_hostname):
-            self.hostname = raw_hostname
-
-    # -- paths and lookups -------------------------------------------------- #
-    def environment(self) -> dict[str, str]:
-        return {
-            "HOME": HOME,
-            "USER": USER,
-            "PWD": self.cwd,
-            "OLDPWD": self.old_cwd or "",
-            "HOSTNAME": self.hostname,
-            "SHELL": "/bin/ossh",
-            "OSMAKER": VERSION,
-            "PATH": "/bin:/usr/bin:/sbin:/usr/sbin",
-        }
-
-    def expand(self, text: str, *, quoted: bool = False) -> str:
-        """Substitute ``~``, ``$VAR``, ``${VAR}`` and ``$?``; single-quoted words stay literal."""
-        if quoted:
-            return text
-        text = text.replace("$?", str(self.exit_code))
-        if text == "~":
-            text = HOME
-        elif text.startswith("~/"):
-            text = HOME + text[1:]
-        environment = self.environment()
-        return VARIABLE_RE.sub(lambda match: environment.get(match.group(1) or match.group(2), ""), text)
 
     def split(self, path: str) -> list[str]:
-        """Expand and normalise a user path into root-relative parts ('.' and '..' resolved)."""
-        text = self.expand(path) or "."
+        """Normalise an already-expanded path into root-relative parts ('.' and '..' resolved)."""
+        text = path or "."
         if not text.startswith("/"):
             text = self.cwd if text == "." else f"{self.cwd}/{text}"
         parts: list[str] = []
@@ -370,9 +369,9 @@ class TinyOS:
         parent: dict[str, Any] | None = None
         name = "/"
         for index, part in enumerate(parts):
-            if node.get("type") != "dir":
+            if not is_dir(node):
                 raise NotADirectoryError(f"{self.path_of(parts[:index]) or '/'}: Not a directory")
-            children = node.get("children", {})
+            children = children_of(node)
             if part not in children:
                 raise FileNotFoundError(f"{self.path_of(parts[: index + 1])}: No such file or directory")
             parent, name, node = node, part, children[part]
@@ -385,12 +384,11 @@ class TinyOS:
     def resolve_parent(self, path: str, *, create_parents: bool = False) -> tuple[dict[str, Any], str]:
         """Return ``(parent node, leaf name)`` for a path whose leaf may not exist yet."""
         parts = self.split(path)
-        shown = self.expand(path) or "/"
         if not parts:
-            raise PermissionError(f"{shown}: cannot modify the root directory")
+            raise PermissionError(f"{path or '/'}: cannot modify the root directory")
         node = self.root
         for index, part in enumerate(parts[:-1]):
-            if node.get("type") != "dir":
+            if not is_dir(node):
                 raise NotADirectoryError(f"{self.path_of(parts[: index + 1])}: Not a directory")
             children = node.setdefault("children", {})
             if part not in children:
@@ -399,7 +397,7 @@ class TinyOS:
                 children[part] = make_dir()
                 self.dirty = True
             node = children[part]
-        if node.get("type") != "dir":
+        if not is_dir(node):
             raise NotADirectoryError(f"{self.path_of(parts[:-1]) or '/'}: Not a directory")
         leaf = parts[-1]
         if len(leaf.encode("utf-8")) > MAX_NAME_LENGTH:
@@ -408,15 +406,16 @@ class TinyOS:
 
     def read_text(self, path: str) -> str:
         node = self.resolve(path)
-        if node.get("type") != "file":
-            raise IsADirectoryError(f"{self.expand(path)}: Is a directory")
-        return node.get("content", "")
+        if not is_file(node):
+            raise IsADirectoryError(f"{path}: Is a directory")
+        content = node.get("content", "")
+        return content if isinstance(content, str) else str(content)
 
     def write_file(self, path: str, content: str) -> None:
         parent, name = self.resolve_parent(path)
         existing = parent["children"].get(name)
-        if existing is not None and existing.get("type") != "file":
-            raise IsADirectoryError(f"{self.expand(path)}: Is a directory")
+        if existing is not None and not is_file(existing):
+            raise IsADirectoryError(f"{path}: Is a directory")
         parent["children"][name] = make_file(content)
         self.dirty = True
 
@@ -425,32 +424,238 @@ class TinyOS:
         existing = parent["children"].get(name)
         if existing is None:
             parent["children"][name] = make_file("")
-        elif existing.get("type") != "file":
-            raise IsADirectoryError(f"{self.expand(path)}: Is a directory")
+        elif not is_file(existing):
+            raise IsADirectoryError(f"{path}: Is a directory")
         else:
             existing["mtime"] = now()
         self.dirty = True
 
-    def save(self, *, force: bool = False) -> None:
-        """Atomically persist the virtual disk; no-op when nothing changed."""
+    def remove(self, path: str) -> None:
+        parent, leaf = self.resolve_parent(path)
+        del parent["children"][leaf]
+        self.dirty = True
+
+    def is_inside(self, candidate: str, ancestor: str) -> bool:
+        """True when ``candidate`` lies below ``ancestor`` in the tree."""
+        candidate_parts, ancestor_parts = self.split(candidate), self.split(ancestor)
+        return (
+            len(ancestor_parts) < len(candidate_parts)
+            and candidate_parts[: len(ancestor_parts)] == ancestor_parts
+        )
+
+    def is_directory(self, path: str) -> bool:
+        """True when ``path`` exists and is a directory."""
+        return is_dir(self.resolve(path))
+
+    def chdir(self, path: str) -> None:
+        """Move into ``path``, remembering where we came from so ``cd -`` works."""
+        node = self.resolve(path)
+        if not is_dir(node):
+            raise NotADirectoryError(f"{path}: Not a directory")
+        self.old_cwd, self.cwd = self.cwd, self.absolute(path)
+
+    def save(self, *, force: bool = False) -> str | None:
+        """Atomically persist the virtual disk; return a warning line when that failed.
+
+        Skipping the write when nothing is dirty keeps a session cheap; ``os.replace``
+        means a crash mid-save cannot leave a half-written disk behind.
+        """
         if self.save_file is None or (not self.dirty and not force):
-            return
+            return None
         temporary = self.save_file.with_name(self.save_file.name + ".tmp")
         try:
             self.save_file.parent.mkdir(parents=True, exist_ok=True)
             temporary.write_text(json.dumps(self.root, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            os.replace(temporary, self.save_file)  # a crash mid-save cannot truncate the disk
+            os.replace(temporary, self.save_file)
         except OSError as exc:  # a read-only or full disk must not kill the session
             temporary.unlink(missing_ok=True)
             self.save_problems += 1
-            if self.save_problems == 1:
-                print(
-                    f"ossh: cannot save {self.save_file} ({exc}); keeping changes in memory only",
-                    file=sys.stderr,
-                )
-            return
+            return f"cannot save {self.save_file} ({exc}); keeping changes in memory only"
         self.save_problems = 0
         self.dirty = False
+        return None
+
+    @classmethod
+    def open(cls, save_file: Path | None) -> tuple[FileSystem, str | None]:
+        """Boot from ``save_file`` when it is readable, otherwise from a fresh disk."""
+        root, problem = load_fs(save_file) if save_file else (fresh_fs(), None)
+        return cls(root, save_file=save_file), problem
+
+
+class TinyOS:
+    """The shell: expansion, dispatch and session state on top of a :class:`FileSystem`."""
+
+    def __init__(
+        self,
+        root: dict[str, Any] | None = None,
+        *,
+        save_file: Path | None = None,
+        read_line: Callable[[str], str | None] | None = None,
+        fs: FileSystem | None = None,
+    ):
+        self.fs = fs if fs is not None else FileSystem(root, save_file=save_file)
+        self.history: list[str] = []
+        self.read_line = read_line
+        self.should_exit = False
+        self.exit_code = 0
+        self.unicode_output = True
+        self.boot_time = now()
+        self.hostname = "osmaker"  # replaced from /etc/hostname below, once expansion works
+        try:
+            raw_hostname = self.read_text("/etc/hostname").strip()
+        except OSError:
+            raw_hostname = ""
+        if HOSTNAME_RE.match(raw_hostname):
+            self.hostname = raw_hostname
+
+    # -- the disk, with shell expansion in front ---------------------------- #
+    @property
+    def root(self) -> dict[str, Any]:
+        return self.fs.root
+
+    @property
+    def cwd(self) -> str:
+        return self.fs.cwd
+
+    @cwd.setter
+    def cwd(self, value: str) -> None:
+        self.fs.cwd = value
+
+    @property
+    def old_cwd(self) -> str | None:
+        return self.fs.old_cwd
+
+    @property
+    def save_file(self) -> Path | None:
+        return self.fs.save_file
+
+    @property
+    def save_problems(self) -> int:
+        return self.fs.save_problems
+
+    @property
+    def dirty(self) -> bool:
+        return self.fs.dirty
+
+    @dirty.setter
+    def dirty(self, value: bool) -> None:
+        self.fs.dirty = value
+
+    def split(self, path: str) -> list[str]:
+        """Expand (shell) then normalise (filesystem) a user path."""
+        return self.fs.split(self.expand(path))
+
+    def absolute(self, path: str) -> str:
+        return self.fs.path_of(self.split(path))
+
+    @staticmethod
+    def path_of(parts: Sequence[str]) -> str:
+        """Join root-relative parts back into a path (used when a copy needs a new leaf)."""
+        return FileSystem.path_of(parts)
+
+    def exists(self, path: str) -> bool:
+        return self.fs.exists(self.expand(path))
+
+    def resolve(self, path: str) -> dict[str, Any]:
+        return self.fs.resolve(self.expand(path))
+
+    def resolve_detailed(self, path: str) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
+        return self.fs.resolve_detailed(self.expand(path))
+
+    def resolve_parent(self, path: str, *, create_parents: bool = False) -> tuple[dict[str, Any], str]:
+        return self.fs.resolve_parent(self.expand(path), create_parents=create_parents)
+
+    def is_inside(self, candidate: str, ancestor: str) -> bool:
+        return self.fs.is_inside(self.expand(candidate), self.expand(ancestor))
+
+    def read_text(self, path: str) -> str:
+        return self.fs.read_text(self.expand(path))
+
+    def write_file(self, path: str, content: str) -> None:
+        self.fs.write_file(self.expand(path), content)
+
+    def touch(self, path: str) -> None:
+        self.fs.touch(self.expand(path))
+
+    def remove(self, path: str) -> None:
+        self.fs.remove(self.expand(path))
+
+    def is_directory(self, path: str) -> bool:
+        """True when ``path`` exists and is a directory."""
+        return is_dir(self.resolve(path))
+
+    def chdir(self, path: str) -> None:
+        self.fs.chdir(self.expand(path))
+
+    def save(self, *, force: bool = False) -> None:
+        problem = self.fs.save(force=force)
+        if problem and self.fs.save_problems == 1:  # warn once, then stay quiet
+            print(f"ossh: {problem}", file=sys.stderr)
+
+    # -- read-eval-print ------------------------------------------------------ #
+    def read_input(self, prompt: str) -> str | None:
+        """One line from the injected reader (a test can supply its own)."""
+        reader = self.read_line or input
+        return reader(prompt)
+
+    def feed(self, lines: Iterable[str]) -> int:
+        """Run ``lines`` in order, saving after each, stopping at ``exit``; the status wins."""
+        for line in lines:
+            output = self.run(line)
+            if output:
+                print(output)
+            self.save()
+            if self.should_exit:
+                break
+        return self.exit_code
+
+    def interact(self) -> int:
+        """Read, evaluate, print, save -- until end of input or ``exit``."""
+        while True:
+            try:
+                line = self.read_input(prompt_for(self))
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print("^C")
+                self.exit_code = 130
+                continue
+            if line is None:  # a reader that reports EOF without raising
+                print()
+                break
+            output = self.run(line)
+            if output:
+                print(output)
+            self.save()
+            if self.should_exit:
+                break
+        return self.exit_code
+
+    # -- shell environment --------------------------------------------------- #
+    def environment(self) -> dict[str, str]:
+        return {
+            "HOME": HOME,
+            "USER": USER,
+            "PWD": self.cwd,
+            "OLDPWD": self.old_cwd or "",
+            "HOSTNAME": self.hostname,
+            "SHELL": "/bin/ossh",
+            "OSMAKER": VERSION,
+            "PATH": "/bin:/usr/bin:/sbin:/usr/sbin",
+        }
+
+    def expand(self, text: str, *, quoted: bool = False) -> str:
+        """Substitute ``~``, ``$VAR``, ``${VAR}`` and ``$?``; single-quoted words stay literal."""
+        if quoted:
+            return text
+        text = text.replace("$?", str(self.exit_code))
+        if text == "~":
+            text = HOME
+        elif text.startswith("~/"):
+            text = HOME + text[1:]
+        environment = self.environment()
+        return VARIABLE_RE.sub(lambda match: environment.get(match.group(1) or match.group(2), ""), text)
 
     # -- execution ---------------------------------------------------------- #
     def run(self, line: str) -> str:
@@ -475,10 +680,11 @@ class TinyOS:
                 alias_tokens = lex(ALIASES[command_name])
                 label = command_name = alias_tokens[0].value
                 args = [token.value for token in alias_tokens[1:]] + parsed.args
-            if command_name not in COMMANDS:
+            info = COMMANDS.get(command_name)
+            if info is None:
                 self.exit_code = 127
                 return f"{command_name}: command not found (try 'help')"
-            output = getattr(self, f"cmd_{command_name}")(args) or ""
+            output = info.run(self, args) or ""
             if not self.should_exit:  # `exit 3` sets its own status
                 self.exit_code = 0
             if parsed.redirect and parsed.target:
@@ -538,10 +744,10 @@ class TinyOS:
         blocks: list[str] = []
         for path in paths or ["."]:
             node = self.resolve(path)
-            if node.get("type") != "dir":
+            if not is_dir(node):
                 blocks.append(f"{path}: {node_size(node)}B")
                 continue
-            children = node.get("children", {})
+            children = children_of(node)
             names = sorted(children)
             if not show_all:
                 names = [name for name in names if not name.startswith(".")]
@@ -554,12 +760,12 @@ class TinyOS:
                 rows = [f"total {sum(node_blocks(children[name]) for name in names)}"]
                 for name in names:
                     child = children[name]
-                    is_dir = child.get("type") == "dir"
+                    entry_is_dir = is_dir(child)
                     rows.append(
-                        f"{'drwxr-xr-x' if is_dir else '-rw-r--r--'} {link_count(child):>3} {USER:<5} "
+                        f"{'drwxr-xr-x' if entry_is_dir else '-rw-r--r--'} {link_count(child):>3} {USER:<5} "
                         f"{content_size(child):>8} "
-                        f"{time.strftime('%b %d %H:%M', time.localtime(child.get('mtime', self.boot_time)))} "
-                        f"{name}{'/' if is_dir else ''}"
+                        f"{time.strftime('%b %d %H:%M', time.localtime(mtime_of(child, self.boot_time)))} "
+                        f"{name}{'/' if entry_is_dir else ''}"
                     )
                 blocks.append("\n".join(rows))
             else:
@@ -576,11 +782,7 @@ class TinyOS:
             if not self.old_cwd:
                 raise OSError("cd: OLDPWD not set")
             target = self.old_cwd
-        node = self.resolve(target)
-        if node.get("type") != "dir":
-            raise NotADirectoryError(f"{self.expand(target)}: Not a directory")
-        self.old_cwd = self.cwd
-        self.cwd = self.absolute(target)
+        self.chdir(target)
         return ""
 
     @command("mkdir [-p] <dir>...", "create directories")
@@ -605,15 +807,14 @@ class TinyOS:
         if not args:
             raise ValueError("missing operand after 'rmdir'")
         for name in args:
-            node, leaf, parent = self.resolve_detailed(name)
-            if node.get("type") != "dir":
+            node, _, parent = self.resolve_detailed(name)
+            if not is_dir(node):
                 raise NotADirectoryError(f"{self.expand(name)}: Not a directory")
-            if node.get("children"):
+            if children_of(node):
                 raise OSError(f"{self.expand(name)}: Directory not empty")
             if parent is None:
                 raise PermissionError("rmdir: cannot remove '/'")
-            del parent["children"][leaf]
-            self.dirty = True
+            self.remove(name)
         return ""
 
     @command("touch <file>...", "create empty files or update their timestamp")
@@ -665,17 +866,16 @@ class TinyOS:
         force, recursive = "f" in flags, "r" in flags or "R" in flags
         for name in names:
             try:
-                node, leaf, parent = self.resolve_detailed(name)
+                node, _, parent = self.resolve_detailed(name)
             except (FileNotFoundError, NotADirectoryError):
                 if force:
                     continue
                 raise
             if parent is None:
                 raise PermissionError("rm: cannot remove '/': that is the whole virtual disk")
-            if node.get("type") == "dir" and node.get("children") and not recursive:
+            if is_dir(node) and children_of(node) and not recursive:
                 raise OSError(f"{self.expand(name)}: Directory not empty (use -r)")
-            del parent["children"][leaf]
-            self.dirty = True
+            self.remove(name)
         return ""
 
     @command("cp [-r] <source>... <destination>", "copy files (directories need -r)")
@@ -686,12 +886,12 @@ class TinyOS:
         recursive = "r" in flags or "R" in flags
         destination = names[-1]
         target_node = self.resolve(destination) if self.exists(destination) else None
-        into_dir = target_node is not None and target_node.get("type") == "dir"
+        into_dir = target_node is not None and is_dir(target_node)
         if not into_dir and len(names) > 2:
             raise NotADirectoryError(f"{destination}: not a directory")
         for source in names[:-1]:
             node = self.resolve(source)
-            if node.get("type") == "dir" and not recursive:
+            if is_dir(node) and not recursive:
                 raise OSError("-r not specified; omitting directory " + repr(source))
             source_absolute = self.absolute(source)
             target_path = (
@@ -701,12 +901,12 @@ class TinyOS:
             )
             if target_path == source_absolute:
                 raise OSError(f"'{source}' and '{target_path}' are the same file")
-            if node.get("type") == "dir" and self.is_inside(target_path, source_absolute):
+            if is_dir(node) and self.is_inside(target_path, source_absolute):
                 raise OSError(f"cannot copy a directory, '{source}', into itself, '{target_path}'")
             parent, leaf = self.resolve_parent(target_path)
             existing = parent["children"].get(leaf)
             if existing is not None and existing.get("type") != node.get("type"):
-                kind = "directory" if existing.get("type") == "dir" else "file"
+                kind = "directory" if is_dir(existing) else "file"
                 raise OSError(f"cannot create {target_path}: replacing a {kind} with a different type")
             parent["children"][leaf] = copy.deepcopy(node)
             parent["children"][leaf]["mtime"] = now()
@@ -719,7 +919,7 @@ class TinyOS:
             raise ValueError("mv needs at least a source and a destination")
         destination = args[-1]
         target_node = self.resolve(destination) if self.exists(destination) else None
-        into_dir = target_node is not None and target_node.get("type") == "dir"
+        into_dir = target_node is not None and is_dir(target_node)
         if not into_dir and len(args) > 2:
             raise NotADirectoryError(f"{destination}: not a directory")
         for source in args[:-1]:
@@ -732,16 +932,16 @@ class TinyOS:
             )
             if target_path == source_absolute:
                 raise OSError(f"'{source}' and '{destination}' are the same file")
-            if node.get("type") == "dir" and self.is_inside(target_path, source_absolute):
+            if is_dir(node) and self.is_inside(target_path, source_absolute):
                 raise OSError(f"cannot move '{source}' to a subdirectory of itself, '{target_path}'")
             target_parent, target_leaf = self.resolve_parent(target_path)
             if target_parent is node:  # moving a directory onto itself
                 raise OSError("mv: cannot move a directory onto itself")
             existing = target_parent["children"].get(target_leaf)
             if existing is not None and existing.get("type") != node.get("type"):
-                kind = "directory" if existing.get("type") == "dir" else "file"
+                kind = "directory" if is_dir(existing) else "file"
                 raise OSError(f"cannot move '{source}' over {kind} '{target_path}'")
-            if existing is not None and existing.get("type") == "dir" and existing.get("children"):
+            if existing is not None and is_dir(existing) and children_of(existing):
                 raise OSError(f"cannot move '{source}' into non-empty directory '{target_path}'")
             target_parent["children"][target_leaf] = copy.deepcopy(node)
             target_parent["children"][target_leaf]["mtime"] = now()
@@ -755,22 +955,22 @@ class TinyOS:
         self.reject_extra(args, "tree", limit=1)
         path = args[0] if args else "."
         node = self.resolve(path)
-        if node.get("type") != "dir":
+        if not is_dir(node):
             return f"{self.absolute(path)}: {node_size(node)}B"
         branch = ("├── ", "└── ", "│   ", "    ") if self.unicode_output else ("|-- ", "`-- ", "|   ", "    ")
         lines = [self.absolute(path)]
         counters = {"dir": 0, "file": 0}
 
         def walk(current: dict[str, Any], prefix: str) -> None:
-            children = sorted(current.get("children", {}))
+            children = sorted(children_of(current))
             for index, name in enumerate(children):
                 child = current["children"][name]
                 connector, spacer = (
                     (branch[1], branch[3]) if index == len(children) - 1 else (branch[0], branch[2])
                 )
                 lines.append(f"{prefix}{connector}{name}{'/' if child.get('type') == 'dir' else ''}")
-                counters["dir" if child.get("type") == "dir" else "file"] += 1
-                if child.get("type") == "dir":
+                counters["dir" if is_dir(child) else "file"] += 1
+                if is_dir(child):
                     walk(child, prefix + spacer)
 
         walk(node, "")
@@ -792,7 +992,7 @@ class TinyOS:
                 f"  Size: {content_size(node)}\tBlocks: {node_blocks(node)}\tIO Block: {BLOCK_SIZE}",
                 f"  Type: {'directory' if node.get('type') == 'dir' else 'regular file'}",
                 f"  Links: {link_count(node)}\tUid: 1000 ({USER})\tGid: 1000 (staff)",
-                f"  Modify: {format_time(node.get('mtime', self.boot_time))}",
+                f"  Modify: {format_time(mtime_of(node, self.boot_time))}",
             ]
         )
 
@@ -812,11 +1012,11 @@ class TinyOS:
         path = args[0] if args else "."
         node = self.resolve(path)
         absolute = self.absolute(path)
-        if node.get("type") != "dir":
+        if not is_dir(node):
             return f"{node_blocks(node):>7}\t{absolute}"
         rows = [
             f"{node_blocks(child):>7}\t{absolute.rstrip('/')}/{name}"
-            for name, child in sorted(node.get("children", {}).items())
+            for name, child in sorted(children_of(node).items())
         ]
         rows.append(f"{node_blocks(node):>7}\t{absolute}")
         return "\n".join(rows)
@@ -943,14 +1143,6 @@ class TinyOS:
                 operands.append(arg)
         return "".join(flags), operands
 
-    def is_inside(self, candidate: str, ancestor: str) -> bool:
-        """True when ``candidate`` is a subdirectory of ``ancestor``."""
-        candidate_parts, ancestor_parts = self.split(candidate), self.split(ancestor)
-        return (
-            len(ancestor_parts) < len(candidate_parts)
-            and candidate_parts[: len(ancestor_parts)] == ancestor_parts
-        )
-
 
 # --------------------------------------------------------------------------- #
 # persistence and start-up
@@ -1048,13 +1240,13 @@ def make_completer(readline: Any, system: TinyOS) -> Callable[[str, int], str | 
             node = system.resolve(directory or ".")
         except OSError:
             return []
-        if node.get("type") != "dir":
+        if not is_dir(node):
             return []
         matches = []
-        for name, child in sorted(node.get("children", {}).items()):
+        for name, child in sorted(children_of(node).items()):
             if not name.startswith(prefix):
                 continue
-            suffix = "/" if child.get("type") == "dir" else " "
+            suffix = "/" if is_dir(child) else " "
             matches.append(f"{directory}/{name}{suffix}" if directory else f"{name}{suffix}")
         return matches
 
@@ -1109,23 +1301,27 @@ def setup_readline(system: TinyOS, *, persist_history: bool = True) -> Callable[
     return save_history
 
 
-def interact(system: TinyOS) -> None:
-    while True:
-        try:
-            line = input(prompt_for(system))
-        except EOFError:
-            print()
-            break
-        except KeyboardInterrupt:
-            print("^C")
-            system.exit_code = 130
-            continue
-        output = system.run(line)
-        if output:
-            print(output)
-        system.save()
-        if system.should_exit:
-            break
+def boot(*, save_file: Path | None = None, ascii_only: bool = False) -> tuple[TinyOS, str | None]:
+    """Start a shell on ``save_file``; the second value explains any load problem.
+
+    Kept separate from :func:`main` so a session (including a broken disk) can be
+    driven from a test without spawning a process.
+    """
+    disk, problem = FileSystem.open(save_file)
+    system = TinyOS(fs=disk, read_line=input)
+    if ascii_only or not supports_unicode():
+        system.unicode_output = False
+    return system, problem
+
+
+def shutdown(system: TinyOS) -> str:
+    """Write the disk one last time and phrase the goodbye accordingly."""
+    if system.save_file is None:
+        return "OS Maker shut down (nothing was saved)."
+    system.save(force=not system.save_file.exists())  # a --reset disk still has to land
+    if system.save_problems:
+        return "OS Maker shut down, but the disk could not be written -- see the warning above."
+    return "OS Maker shut down. Your virtual disk has been saved."
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1168,10 +1364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except OSError as exc:
             print(f"ossh: could not reset {save_file} ({exc})", file=sys.stderr)
             return 1
-    root, problem = load_fs(save_file) if save_file else (fresh_fs(), None)
-    system = TinyOS(root, save_file=save_file, read_line=input)
-    if args.ascii or not supports_unicode():
-        system.unicode_output = False
+    system, problem = boot(save_file=save_file, ascii_only=args.ascii)
     if problem:
         print(f"ossh: {problem}", file=sys.stderr)
     if not args.no_banner:
@@ -1182,28 +1375,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.execute and sys.stdin is not None and sys.stdin.isatty():
         save_history = setup_readline(system, persist_history=not args.no_save)
     try:
-        if args.execute:
-            for line in args.execute:
-                output = system.run(line)
-                if output:
-                    print(output)
-                system.save()
-                if system.should_exit:
-                    break
-        else:
-            interact(system)
+        status = system.feed(args.execute) if args.execute else system.interact()
     finally:
         if save_history:
             save_history()
-        if save_file is not None:
-            system.save()
-            if system.save_problems:
-                print("OS Maker shut down, but the disk could not be written -- see the warning above.")
-            else:
-                print("OS Maker shut down. Your virtual disk has been saved.")
-        else:
-            print("OS Maker shut down (nothing was saved).")
-    return system.exit_code
+        print(shutdown(system))
+    return status
 
 
 if __name__ == "__main__":

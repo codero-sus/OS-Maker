@@ -142,14 +142,24 @@ pipe too.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t .      # 119 tests, stdlib only, no Docker/network needed
+python3 -m unittest discover -s tests -t .      # 206 tests, stdlib only, no Docker/network needed
 python3 -m compileall -q build_os.py os_maker.py
-pip install ruff && ruff check . && ruff format --check .
+
+pip install ruff mypy "coverage[toml]"           # the three gates CI also runs
+ruff check . && ruff format --check .
+python3 -m mypy                                  # --strict, configured in pyproject.toml
+python3 -m coverage run -m unittest discover -s tests -t . && python3 -m coverage report
 ```
+
+`os_maker.py` is layered on purpose: `lex`/`parse` for the command line, `FileSystem` for the node tree and the
+save file, `TinyOS` for the shell (expansion, dispatch, history), then readline and the CLI. `build_os.py` decides
+everything into a `Plan` first and only then runs `Workspace` → `stage` → `execute` → `collect` → `report`, so a bad
+flag never survives to minute twenty of a build.
 
 The suite covers the shell's lexer, path handling and every built-in, plus the builder's validation, command
 assembly, staging tree and — through a stub `lb` — the complete build → ISO → checksum → log pipeline and the QEMU
-boot test. CI (`.github/workflows/ci.yml`) lints, runs the tests on Linux/macOS/Windows for Python 3.10 and 3.12,
-and on pushes to `main` also builds a minimal ISO in Docker and boots it in QEMU.
+boot test (93% branch coverage; CI fails below 85%). CI (`.github/workflows/ci.yml`) lints, type-checks, runs the
+tests on Linux/macOS/Windows for Python 3.10 and 3.12, and on pushes to `main` also builds a minimal ISO in Docker
+and boots it in QEMU.
 
 Both scripts are single files with `--help` for every flag; nothing else needs to be installed.

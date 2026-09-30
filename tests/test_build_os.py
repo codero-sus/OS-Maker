@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
@@ -524,6 +525,530 @@ class CommandLineTests(unittest.TestCase):
     def test_unknown_release_only_warns(self) -> None:
         code, _ = self.main(["--name", "Sid", "--release", "sarge", "--dry-run"])
         self.assertEqual(code, 0)
+
+
+class EngineProbeTests(unittest.TestCase):
+    """How the builder decides *where* to run, on a simulated host."""
+
+    @staticmethod
+    def args(argv: list[str]) -> object:
+        return build_os.build_parser().parse_args(argv)
+
+    def test_native_build_is_refused_off_linux(self) -> None:
+        with unittest.mock.patch.object(build_os.platform, "system", return_value="Darwin"):
+            usable, reason = build_os.native_build_ready()
+        self.assertFalse(usable)
+        self.assertIn("only runs on Linux", reason)
+
+    def test_native_build_lists_the_tools_it_misses(self) -> None:
+        installed: dict[str, str | None] = {}
+        with (
+            unittest.mock.patch.object(build_os.platform, "system", return_value="Linux"),
+            unittest.mock.patch.object(
+                build_os.shutil, "which", side_effect=lambda tool: installed.get(tool)
+            ),
+        ):
+            usable, reason = build_os.native_build_ready()
+            self.assertFalse(usable)
+            self.assertIn("live-build is not installed", reason)
+
+            installed["lb"] = "/usr/bin/lb"  # with lb present, the tool check itself has the say
+            usable, reason = build_os.native_build_ready()
+            self.assertFalse(usable)
+            self.assertIn("missing build tools: debootstrap, xorriso, mksquashfs", reason)
+            self.assertIn("apt-get install", reason)  # and it says how to fix it
+
+            installed["mksquashfs"] = "/usr/bin/mksquashfs"
+            _, reason = build_os.native_build_ready()
+            self.assertIn("debootstrap, xorriso", reason)
+            self.assertNotIn("mksquashfs:", reason)
+
+    def test_native_build_needs_root(self) -> None:
+        with (
+            unittest.mock.patch.object(build_os.platform, "system", return_value="Linux"),
+            unittest.mock.patch.object(build_os.shutil, "which", return_value="/usr/bin/tool"),
+            unittest.mock.patch.object(build_os.os, "geteuid", return_value=1000, create=True),
+        ):
+            usable, reason = build_os.native_build_ready()
+        self.assertFalse(usable)
+        self.assertIn("as root", reason)
+
+    def test_native_build_is_ready_when_all_is_well(self) -> None:
+        with (
+            unittest.mock.patch.object(build_os.platform, "system", return_value="Linux"),
+            unittest.mock.patch.object(build_os.shutil, "which", return_value="/usr/bin/tool"),
+            unittest.mock.patch.object(build_os.os, "geteuid", return_value=0, create=True),
+        ):
+            self.assertEqual(build_os.native_build_ready(), (True, ""))
+
+    def test_docker_is_unusable_without_the_binary(self) -> None:
+        with unittest.mock.patch.object(build_os.shutil, "which", return_value=None):
+            usable, reason = build_os.docker_ready()
+        self.assertFalse(usable)
+        self.assertIn("not found on PATH", reason)
+
+    def test_docker_ready_reports_the_daemon_version(self) -> None:
+        completed = unittest.mock.Mock(returncode=0, stdout="27.1.1\n", stderr="")
+        with (
+            unittest.mock.patch.object(build_os.shutil, "which", return_value="/usr/bin/docker"),
+            unittest.mock.patch.object(build_os.subprocess, "run", return_value=completed),
+        ):
+            self.assertEqual(build_os.docker_ready(), (True, "27.1.1"))
+
+    def test_docker_ready_reports_a_stopped_daemon(self) -> None:
+        completed = unittest.mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock.",
+        )
+        with (
+            unittest.mock.patch.object(build_os.shutil, "which", return_value="/usr/bin/docker"),
+            unittest.mock.patch.object(build_os.subprocess, "run", return_value=completed),
+        ):
+            usable, reason = build_os.docker_ready()
+        self.assertFalse(usable)
+        self.assertIn("daemon is not reachable", reason)
+        self.assertIn("Cannot connect", reason)
+
+    def test_docker_ready_reports_a_broken_install(self) -> None:
+        with (
+            unittest.mock.patch.object(build_os.shutil, "which", return_value="/usr/bin/docker"),
+            unittest.mock.patch.object(build_os.subprocess, "run", side_effect=OSError("exec format error")),
+        ):
+            usable, reason = build_os.docker_ready()
+        self.assertFalse(usable)
+        self.assertIn("could not run 'docker info'", reason)
+
+    def test_select_engine_prefers_native_and_stays_quiet_about_the_daemon(self) -> None:
+        with (
+            unittest.mock.patch.object(build_os, "native_build_ready", return_value=(True, "")),
+            unittest.mock.patch.object(build_os, "docker_ready", return_value=(True, "27.1.1")),
+        ):
+            self.assertEqual(
+                build_os.select_engine(self.args(["--name", "X", "--container", "auto"])), ("native", None)
+            )
+
+    def test_select_engine_reports_the_daemon_it_found(self) -> None:
+        with (
+            unittest.mock.patch.object(build_os, "native_build_ready", return_value=(False, "not root")),
+            unittest.mock.patch.object(build_os, "docker_ready", return_value=(True, "27.1.1")),
+        ):
+            self.assertEqual(build_os.select_engine(self.args(["--name", "X"])), ("docker", "27.1.1"))
+
+    def test_select_engine_explains_every_option(self) -> None:
+        with (
+            unittest.mock.patch.object(
+                build_os, "native_build_ready", return_value=(False, "live-build missing")
+            ),
+            unittest.mock.patch.object(build_os, "docker_ready", return_value=(False, "docker missing")),
+            self.assertRaises(build_os.BuildError) as caught,
+        ):
+            build_os.select_engine(self.args(["--name", "X"]))
+        message = str(caught.exception)
+        for line in (
+            "live-build missing",
+            "native live-build: live-build missing",
+            "docker missing",
+            "hint:",
+        ):
+            self.assertIn(line, message)
+
+    def test_select_engine_drops_the_hint_when_the_user_ruled_docker_out(self) -> None:
+        with (
+            unittest.mock.patch.object(build_os, "native_build_ready", return_value=(False, "not root")),
+            unittest.mock.patch.object(build_os, "docker_ready", return_value=(False, "docker missing")),
+            self.assertRaises(build_os.BuildError) as caught,
+        ):
+            build_os.select_engine(self.args(["--name", "X", "--container", "never"]))
+        self.assertNotIn("hint:", str(caught.exception))
+
+    def test_a_dry_run_plans_a_docker_build_even_without_an_engine(self) -> None:
+        with (
+            unittest.mock.patch.object(build_os, "native_build_ready", return_value=(False, "no")),
+            unittest.mock.patch.object(build_os, "docker_ready", return_value=(False, "nope")),
+            captured() as out,
+        ):
+            mode, daemon = build_os.select_engine(self.args(["--name", "X", "--dry-run"]))
+        self.assertEqual((mode, daemon), ("docker", None))
+        self.assertIn("showing the plan anyway", out.getvalue())
+
+
+class CommandRunTests(unittest.TestCase):
+    def test_run_streams_logs_and_keeps_the_tail(self) -> None:
+        script = "for i in range(1, 46): print('line%d' % i)\nprint('oops')\nraise SystemExit(3)"
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "build.log"
+            with captured():
+                result = build_os.run([sys.executable, "-c", script], log_path=log)
+            written = log.read_text(encoding="utf-8")
+        self.assertEqual(result.returncode, 3)
+        self.assertFalse(result.ok)
+        self.assertEqual(len(result.tail), 40)  # only the last 40 lines are kept for the error report
+        self.assertEqual(result.tail[0], "line7")  # 46 lines in, the last 40 kept
+        self.assertEqual(result.tail[-1], "oops")  # stderr is merged into the same stream
+        self.assertIn("$ ", written)
+        self.assertIn("line45", written)
+
+    def test_run_survives_a_process_without_a_pipe(self) -> None:
+        class Silent:
+            stdout = None
+
+            def wait(self) -> int:
+                return 0
+
+        with unittest.mock.patch.object(build_os.subprocess, "Popen", return_value=Silent()):
+            result = build_os.run(["true"], echo=False)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.tail, [])
+
+    def test_quiet_run_hides_the_command_but_not_the_progress(self) -> None:
+        with captured() as out:
+            build_os.run([sys.executable, "-c", "print('hi')"], echo=False)
+        text = out.getvalue()
+        self.assertNotIn("$ ", text)
+        self.assertIn("hi", text)
+
+
+class BootTestTests(unittest.TestCase):
+    """--boot-test: the QEMU smoke test, with QEMU standing in for a fake process."""
+
+    class FakeQEMU:
+        """A child process that "runs" by writing a console log, then exits."""
+
+        def __init__(self, command: list[str], text: str, *, exit_code: int = 0) -> None:
+            self.log = Path(command[command.index("-serial") + 1][len("file:") :])
+            self.exit_code = exit_code
+            self.terminated = False
+            if text:  # QEMU writes the serial log as it boots, before anyone polls
+                self.log.write_text(text, encoding="utf-8")
+
+        def poll(self) -> int | None:
+            return self.exit_code if self.log.exists() or self.exit_code else None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float = 0) -> int:
+            return self.exit_code
+
+        def kill(self) -> None:
+            return None
+
+    @staticmethod
+    def fake_popen(text: str, exit_code: int = 0):
+        def spawn(command, **_kwargs):
+            return BootTestTests.FakeQEMU(list(command), text, exit_code=exit_code)
+
+        return unittest.mock.patch.object(build_os.subprocess, "Popen", side_effect=spawn)
+
+    def test_wait_for_boot_returns_the_console_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "console.log"
+            log.write_text("Debian GNU/Linux 13 live-testing login: ", encoding="utf-8")
+            text = build_os.wait_for_boot(log, unittest.mock.Mock(poll=lambda: None), timeout=2)
+        self.assertIn("login:", text or "")
+
+    def test_wait_for_boot_gives_up_when_qemu_exits_early(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            process = unittest.mock.Mock(poll=lambda: 1)
+            self.assertIsNone(build_os.wait_for_boot(Path(tmp) / "missing.log", process, timeout=2))
+
+    def test_boot_test_is_skipped_for_arm_images(self) -> None:
+        with captured() as out:
+            self.assertEqual(build_os.qemu_boot_test(Path("x.iso"), "arm64", 5), 0)
+        self.assertIn("only supports amd64", out.getvalue())
+
+    def test_boot_test_needs_qemu_installed(self) -> None:
+        with (
+            unittest.mock.patch.object(build_os.shutil, "which", return_value=None),
+            self.assertRaises(build_os.BuildError) as caught,
+        ):
+            build_os.qemu_boot_test(Path("x.iso"), "amd64", 5)
+        self.assertIn("qemu-system-x86_64 was not found", str(caught.exception))
+
+    def test_boot_test_passes_when_the_login_prompt_appears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            iso, log = Path(tmp) / "x.iso", Path(tmp) / "build.log"
+            iso.write_bytes(b"ISO9660")
+            log.write_text("earlier output\n", encoding="utf-8")
+            with (
+                unittest.mock.patch.object(
+                    build_os.shutil, "which", return_value="/usr/bin/qemu-system-x86_64"
+                ),
+                self.fake_popen("Debian GNU/Linux 13\nlive-testing login: "),
+                captured() as out,
+            ):
+                code = build_os.qemu_boot_test(iso, "amd64", 5, log_path=log)
+            self.assertEqual(code, 0)
+            self.assertIn("Boot test passed", out.getvalue())
+            self.assertIn("live-testing login", log.read_text(encoding="utf-8"))
+
+    def test_boot_test_fails_on_a_blank_console(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            iso = Path(tmp) / "x.iso"
+            iso.write_bytes(b"ISO9660")
+            with (
+                unittest.mock.patch.object(
+                    build_os.shutil, "which", return_value="/usr/bin/qemu-system-x86_64"
+                ),
+                self.fake_popen("", exit_code=1),
+                captured() as out,
+                self.assertRaises(build_os.BuildError) as caught,
+            ):
+                build_os.qemu_boot_test(iso, "amd64", 5)
+        self.assertIn("no live-system banner", str(caught.exception))
+        self.assertIn("no console output", out.getvalue())
+
+
+class PlanTests(unittest.TestCase):
+    """decide()/Workspace/report: the phases main() used to do inline."""
+
+    @staticmethod
+    def plan(argv: list[str]) -> build_os.Plan:
+        """decide() as if Docker were available, so plans can be built anywhere."""
+        with unittest.mock.patch.object(build_os, "select_engine", return_value=("docker", None)):
+            return build_os.decide(build_os.build_parser().parse_args(argv))
+
+    def test_bad_flags_are_rejected_before_any_work(self) -> None:
+        cases = [
+            (["--name", " "], "non-empty"),
+            (["--name", "a\nb"], "non-empty"),
+            (["--name", "Ok", "--release", "Two Words"], "invalid --release"),
+            (["--name", "Ok", "--boot-timeout", "0"], "positive number"),
+            (["--name", "Ok", "--cache-dir", "/tmp/c", "--container", "never"], "only applies to Docker"),
+            (["--name", "Ok", "--packages", "!!"], "invalid package name"),
+            (["--name", "Ok", "--copy", "nocolon"], "SOURCE:DESTINATION"),
+        ]
+        for argv, fragment in cases:
+            with self.subTest(argv=argv), self.assertRaises(build_os.BuildError) as caught:
+                self.plan(argv)
+            self.assertIn(fragment, str(caught.exception))
+
+    def test_a_plan_names_the_image_after_the_build(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self.plan(
+                ["--name", "My Desk OS", "--release", "trixie", "--architecture", "arm64", "--output", tmp]
+            )
+        self.assertEqual(plan.hostname, "my-desk-os")
+        self.assertEqual(plan.destination.name, "my-desk-os-trixie-arm64.iso")
+        self.assertEqual(plan.output, Path(tmp).resolve())
+        self.assertEqual(plan.mode, "docker")
+        self.assertIsNone(plan.daemon)
+        self.assertIn("linux-image-arm64", plan.packages)
+        self.assertTrue(plan.log)
+        self.assertIsNone(plan.workspace)
+        self.assertEqual(plan.project, Path("<temporary workspace>/live-os"))
+        self.assertEqual(plan.config_command()[0], "lb")
+
+    def test_an_unknown_suite_is_a_warning_not_a_stop(self) -> None:
+        with captured() as out:
+            plan = self.plan(["--name", "Sid", "--release", "sarge", "--dry-run"])
+        self.assertEqual(plan.release, "sarge")
+        self.assertIn("not a known Debian suite", out.getvalue())
+
+    def test_a_native_plan_prints_the_commands_it_would_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self.plan(["--name", "Nat", "--dry-run", "--output", tmp, "--container", "always"])
+            with captured() as out:
+                plan.describe()
+        text = out.getvalue()
+        self.assertIn("mode:       docker", text)
+        self.assertIn("apply-staging.sh", text)
+        self.assertIn("--iso-application Nat", text.replace("\n", ""))
+
+    def test_free_space_is_only_a_warning(self) -> None:
+        plan = self.plan(["--name", "Space", "--dry-run"])
+        with unittest.mock.patch.object(build_os, "free_gib", return_value=3.0), captured() as out:
+            build_os.check_free_space(plan)
+        self.assertIn("only 3.0 GiB free", out.getvalue())
+        with unittest.mock.patch.object(build_os, "free_gib", return_value=900.0), captured() as out:
+            build_os.check_free_space(plan)
+        self.assertEqual(out.getvalue(), "")
+        with (
+            unittest.mock.patch.object(build_os, "free_gib", return_value=3.0),
+            unittest.mock.patch.object(build_os, "RECOMMENDED_FREE_GIB", 0),
+            captured() as out,
+        ):
+            build_os.check_free_space(plan)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_free_space_checks_the_workspace_that_will_be_used(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self.plan(
+                ["--name", "Space", "--dry-run", "--work-dir", str(Path(tmp) / "deep" / "nested")]
+            )
+            seen: list[Path] = []
+
+            def record(where: Path) -> float:
+                seen.append(where)
+                return 1.0
+
+            with unittest.mock.patch.object(build_os, "free_gib", side_effect=record), captured():
+                build_os.check_free_space(plan)
+        self.assertEqual(seen, [Path(tmp)])  # walked up to the first existing directory
+
+    def test_skip_checks_silences_the_disk_warning(self) -> None:
+        plan = self.plan(["--name", "Skip", "--dry-run", "--skip-checks"])
+        with unittest.mock.patch.object(build_os, "free_gib", return_value=0.1), captured() as out:
+            build_os.check_free_space(plan)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_a_workspace_clears_stale_images_but_never_the_users_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "live-os").mkdir()
+            (root / "live-os" / "old.iso").write_bytes(b"old")
+            plan = self.plan(["--name", "Ws", "--dry-run", "--work-dir", str(root)])
+            workspace = build_os.Workspace.create(plan)
+            self.assertFalse((root / "live-os" / "old.iso").exists())
+            self.assertEqual(workspace.project, root / "live-os")
+            self.assertTrue(workspace.log_path is not None)
+            with captured() as out:
+                workspace.close()  # a user-provided directory is simply left alone
+            self.assertEqual(out.getvalue(), "")
+            self.assertTrue(root.exists())
+            kept_elsewhere = build_os.Workspace.create(
+                self.plan(["--name", "Ws", "--dry-run", "--work-dir", str(root), "--keep-work"])
+            )
+            with captured() as out:
+                kept_elsewhere.close()
+            self.assertIn("Build workspace kept at", out.getvalue())
+
+    def test_a_temporary_workspace_disappears_unless_kept(self) -> None:
+        plan = self.plan(["--name", "Tmp", "--dry-run"])
+        workspace = build_os.Workspace.create(plan)
+        self.assertTrue(workspace.project.is_dir())
+        self.assertFalse(workspace.log_path.exists())
+        created = workspace.root
+        workspace.close()
+        self.assertFalse(created.exists(), "the scratch directory should have been removed")
+
+        kept = build_os.Workspace.create(self.plan(["--name", "Tmp", "--dry-run", "--keep-work"]))
+        with captured() as out:
+            kept.close()
+        self.assertIn("kept at", out.getvalue())
+        self.assertTrue(kept.root.exists())
+        shutil.rmtree(kept.root, ignore_errors=True)
+
+    def test_report_and_sidecars_describe_the_finished_image(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan = self.plan(["--name", "Done", "--dry-run", "--output", str(root / "dist")])
+            plan.output.mkdir(parents=True)
+            iso = root / "live.iso"
+            iso.write_bytes(b"x" * 2048)
+            workspace = build_os.Workspace(root=root, temporary=False, keep=False, log=True)
+            workspace.log_path = root / "build.log"
+            workspace.log_path.write_text("building...\n", encoding="utf-8")
+            build_os.collect(workspace, plan, iso, "abc123")
+            checksum = plan.destination.with_suffix(".iso.sha256")
+            self.assertEqual(checksum.read_text(encoding="utf-8"), f"abc123  {plan.destination.name}\n")
+            self.assertEqual(
+                (root / "dist" / (plan.destination.name + ".log")).read_text(encoding="utf-8"),
+                "building...\n",
+            )
+            with captured() as out:
+                build_os.report(plan, "abc123")
+        text = out.getvalue()
+        for fragment in ("Bootable ISO created", "abc123", "qemu-system-x86_64", "balenaEtcher"):
+            self.assertIn(fragment, text)
+
+    def test_main_translates_failures_into_exit_codes(self) -> None:
+        """Usage errors, build failures, Ctrl-C and I/O trouble each get their own code."""
+        argv = ["--name", "Fail", "--container", "always"]
+
+        def run_main(**patches: object) -> tuple[int, str]:
+            with (
+                unittest.mock.patch.object(build_os, "select_engine", return_value=("docker", None)),
+                unittest.mock.patch.object(build_os, "run_build", **patches),
+                captured() as out,
+            ):
+                return build_os.main(list(argv)), out.getvalue()
+
+        code, text = run_main(side_effect=build_os.BuildError("boom"))
+        self.assertEqual(code, 1)
+        self.assertIn("os-maker: boom", text)
+        self.assertIn("workspace was deleted", text)  # the scratch dir is gone, so say so
+
+        code, text = run_main(side_effect=KeyboardInterrupt)
+        self.assertEqual(code, 130)
+        self.assertIn("interrupted", text)
+
+        code, text = run_main(side_effect=OSError("no space left on device"))
+        self.assertEqual(code, 1)
+        self.assertIn("no space left on device", text)
+
+        code, text = run_main(return_value=0)
+        self.assertEqual(code, 0)
+        self.assertNotIn("workspace was deleted", text)
+
+
+class DryRunAndFinishTests(unittest.TestCase):
+    """The two ends of a build: the printed plan for a native run, and the boot test."""
+
+    @staticmethod
+    def plan(argv: list[str], mode: str = "docker") -> build_os.Plan:
+        with unittest.mock.patch.object(build_os, "select_engine", return_value=(mode, None)):
+            return build_os.decide(build_os.build_parser().parse_args(argv))
+
+    def test_a_native_plan_lists_the_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self.plan(["--name", "Natty", "--output", tmp, "--dry-run"], mode="native")
+            with captured() as out:
+                plan.describe()
+        text = out.getvalue()
+        self.assertIn("mode:       native", text)
+        self.assertIn("lb config --distribution", text)
+        self.assertIn("&& lb build", text)
+        with captured() as announced:
+            plan.announce()
+        self.assertIn("Building natively", announced.getvalue())
+
+    def test_a_plan_announces_the_daemon_it_found(self) -> None:
+        with (
+            unittest.mock.patch.object(build_os, "select_engine", return_value=("docker", "27.1.1")),
+            captured() as out,
+        ):
+            plan = build_os.decide(build_os.build_parser().parse_args(["--name", "Dock", "--dry-run"]))
+            plan.announce()
+        self.assertIn("daemon 27.1.1", out.getvalue())
+        with (
+            unittest.mock.patch.object(build_os, "select_engine", return_value=("docker", None)),
+            captured() as out,
+        ):
+            build_os.decide(build_os.build_parser().parse_args(["--name", "Dock", "--dry-run"])).announce()
+        self.assertIn("no daemon here yet", out.getvalue())
+
+    def test_run_build_boots_the_finished_image_when_asked(self) -> None:
+        def fake_execute(workspace, _plan):  # stands in for `lb build` / the container
+            (workspace.project / "built.iso").write_bytes(b"ISO9660" * 200)
+            return build_os.CommandResult(0, ["live-build finished"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self.plan(
+                ["--name", "Booted", "--output", str(Path(tmp) / "dist"), "--boot-test", "--dry-run"]
+            )
+            with (
+                unittest.mock.patch.object(build_os, "execute", side_effect=fake_execute),
+                unittest.mock.patch.object(build_os, "qemu_boot_test", return_value=0) as boot,
+                captured() as out,
+            ):
+                self.assertEqual(build_os.run_build(plan), 0)
+            self.assertEqual(boot.call_args.args[1:], ("amd64", plan.boot_timeout))
+            self.assertEqual(boot.call_args.kwargs["log_path"].name, "build.log")
+            self.assertTrue(plan.destination.is_file(), "the ISO was collected into --output")
+            self.assertTrue(plan.destination.with_suffix(".iso.sha256").is_file())
+            self.assertIn("Bootable ISO created", out.getvalue())
+
+    def test_a_build_without_logging_writes_no_log_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = self.plan(["--name", "Silent", "--output", tmp, "--no-log", "--dry-run"])
+            workspace = build_os.Workspace.create(plan)
+            try:
+                self.assertIsNone(workspace.log_path)
+            finally:
+                workspace.close()
+            self.assertFalse((workspace.root / "build.log").exists())
 
 
 def subprocess_run(command: list[str], cwd: Path | None = None) -> int:

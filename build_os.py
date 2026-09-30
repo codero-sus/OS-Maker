@@ -28,6 +28,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Protocol
 
 __version__ = "2.0.0"
 
@@ -387,7 +388,13 @@ def run(
     return CommandResult(process.wait(), tail)
 
 
-def wait_for_boot(console_log: Path, process: subprocess.Popen[str], timeout: float) -> str | None:
+class ProcessLike(Protocol):
+    """The one thing :func:`wait_for_boot` needs from the QEMU child process."""
+
+    def poll(self) -> int | None: ...
+
+
+def wait_for_boot(console_log: Path, process: ProcessLike, timeout: float) -> str | None:
     """Poll ``console_log`` for a live-system banner; return the console text or None on timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -616,126 +623,92 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+@dataclass(frozen=True)
+class Plan:
+    """Everything a build needs, decided before a single command runs."""
 
-    name = args.name.strip()
-    if not name or any(char in name for char in "\r\n\0"):
-        print("os-maker: --name must be a non-empty, single-line name", file=sys.stderr)
-        return 2
-    if not RELEASE_RE.match(args.release):
-        print(f"os-maker: invalid --release {args.release!r}", file=sys.stderr)
-        return 2
-    if args.release not in KNOWN_RELEASES:
-        print_warning(
-            f"{args.release!r} is not a known Debian suite ({', '.join(KNOWN_RELEASES)}); live-build may reject it"
-        )
-    if args.boot_timeout <= 0:
-        print("os-maker: --boot-timeout must be a positive number of seconds", file=sys.stderr)
-        return 2
-    if args.cache_dir is not None and args.container == "never":
-        print("os-maker: --cache-dir only applies to Docker builds", file=sys.stderr)
-        return 2
+    name: str
+    hostname: str
+    release: str
+    architecture: str
+    packages: tuple[str, ...]
+    copies: tuple[tuple[str, PurePosixPath], ...]
+    hooks: tuple[Path, ...]
+    compression: str
+    with_firmware: bool
+    mode: str  # "docker" or "native"
+    build_image: str
+    daemon: str | None  # Docker version string when a daemon answered
+    host_architecture: str | None
+    workspace: Path | None  # None means "use a temporary directory"
+    output: Path
+    destination: Path
+    log: bool
+    cache_dir: Path | None
+    keep_work: bool
+    skip_checks: bool
+    dry_run: bool
+    quiet: bool
+    boot_test: bool
+    boot_timeout: int
 
-    try:
-        packages = (
-            parse_packages(args.packages, args.architecture)
-            if args.packages
-            else default_packages(args.architecture)
-        )
-        copies = [parse_copy_spec(spec) for spec in args.copy]
-    except BuildError as exc:
-        print(f"os-maker: {exc}", file=sys.stderr)
-        return 2
+    @property
+    def project(self) -> Path:
+        """The live-build project directory inside the workspace."""
+        root = self.workspace if self.workspace is not None else Path("<temporary workspace>")
+        return root / "live-os"
 
-    hostname = sanitize_hostname(name)
-    native_usable, native_problem = native_build_ready()
-    docker_usable, docker_detail = docker_ready()
-    mode, problem = select_build_mode(args.container, native_usable, docker_usable)
-    if mode == "error" and args.dry_run:
-        print_warning(f"{problem}; showing the plan anyway (assuming a Docker build)")
-        mode = "docker"
-    elif mode == "error":
-        print(f"os-maker: {problem}.", file=sys.stderr)
-        print(f"    native live-build: {native_problem or 'ready'}", file=sys.stderr)
-        print(
-            f"    docker: {docker_detail if not docker_usable else 'ready (' + docker_detail + ')'}",
-            file=sys.stderr,
-        )
-        if not docker_usable and args.container != "never":
+    @property
+    def docker_image(self) -> str:
+        return build_image_for(self.release, self.build_image)
+
+    def announce(self) -> None:
+        """Say how the build will happen, and warn about anything that will make it slow."""
+        if self.mode == "docker" and self.daemon:
             print(
-                "    hint: install Docker Desktop (Windows/macOS) or Docker Engine (Linux), start it, then retry",
-                file=sys.stderr,
+                f"Building inside {self.docker_image} via Docker (daemon {self.daemon}); "
+                "the host OS is not modified."
             )
-        return 2
-    if mode == "docker":
-        if docker_usable:
-            print(
-                f"Building inside {build_image_for(args.release, args.build_image)} via Docker "
-                f"(daemon {docker_detail}); the host OS is not modified."
-            )
+        elif self.mode == "docker":
+            print(f"Planned build inside {self.docker_image} via Docker (no daemon here yet).")
         else:
             print(
-                f"Planned build inside {build_image_for(args.release, args.build_image)} via Docker (no daemon here yet)."
+                "Building natively with the installed live-build tooling (this needs root and can take a while)."
             )
-    else:
-        print(
-            "Building natively with the installed live-build tooling (this needs root and can take a while)."
-        )
+        if self.mode == "docker" and self.host_architecture not in (None, self.architecture):
+            print_warning(
+                f"target architecture {self.architecture} differs from this host ({self.host_architecture}); "
+                "the build runs under emulation and can be several times slower"
+            )
 
-    machine_arch = host_architecture()
-    if mode == "docker" and machine_arch not in (None, args.architecture):
-        print_warning(
-            f"target architecture {args.architecture} differs from this host ({machine_arch}); the build "
-            "runs under emulation and can be several times slower"
-        )
-
-    workspace_hint = args.work_dir.expanduser() if args.work_dir else Path(tempfile.gettempdir())
-    while not workspace_hint.exists() and workspace_hint != workspace_hint.parent:
-        workspace_hint = workspace_hint.parent  # walk up to the first existing ancestor
-    free = free_gib(workspace_hint)
-    if not args.skip_checks and free is not None and free < RECOMMENDED_FREE_GIB:
-        print_warning(
-            f"only {free:.1f} GiB free where the workspace lives; a live build usually needs "
-            f">= {RECOMMENDED_FREE_GIB} GiB. Use --work-dir to build somewhere with more space."
-        )
-
-    output = args.output.resolve()
-    cache_dir = args.cache_dir.expanduser().resolve() if args.cache_dir else None
-    config_command = lb_config_command(
-        release=args.release,
-        architecture=args.architecture,
-        name=name,
-        compression=args.compression,
-        with_firmware=args.with_firmware,
-    )
-    destination = output / f"{hostname}-{args.release}-{args.architecture}.iso"
-
-    if args.dry_run:
+    def describe(self) -> None:
+        """The dry-run report: what *would* happen, in enough detail to review."""
         print_step("Dry run -- nothing was executed")
-        print(f"    mode:       {mode}")
-        print(f"    output ISO: {destination}")
-        print(f"    packages:   {', '.join(packages)}")
-        if args.boot_test:
+        print(f"    mode:       {self.mode}")
+        print(f"    output ISO: {self.destination}")
+        print(f"    packages:   {', '.join(self.packages)}")
+        if self.boot_test:
             print(
-                f"    boot test:  QEMU smoke test after the build ({args.boot_timeout}s timeout, skipped in a dry run)"
+                f"    boot test:  QEMU smoke test after the build ({self.boot_timeout}s timeout, skipped in a dry run)"
             )
-        for source, target in copies:
+        for source, target in self.copies:
             print(f"    copy:       {source} -> {target}")
-        for hook in args.hook:
+        for hook in self.hooks:
             print(f"    hook:       {hook}")
-        workspace = args.work_dir.expanduser().resolve() if args.work_dir else Path("<temporary workspace>")
-        if mode == "docker":
+        config = self.config_command()
+        if self.mode == "docker":
             print(
                 "    docker:     "
                 + shlex.join(
                     docker_run_command(
-                        workspace=workspace,
-                        build_image=build_image_for(args.release, args.build_image),
-                        script=docker_setup_script(config_command),
-                        host_architecture=machine_arch,
-                        target_architecture=args.architecture,
-                        cache_dir=cache_dir,
+                        workspace=self.workspace
+                        if self.workspace is not None
+                        else Path("<temporary workspace>"),
+                        build_image=self.docker_image,
+                        script=docker_setup_script(config),
+                        host_architecture=self.host_architecture,
+                        target_architecture=self.architecture,
+                        cache_dir=self.cache_dir,
                     )
                 )
             )
@@ -743,108 +716,285 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 "    commands:   "
                 + " && ".join(
-                    [shlex.join(config_command), f"bash {STAGING_DIRNAME}/{STAGING_SCRIPT_NAME}", "lb build"]
+                    [shlex.join(config), f"bash {STAGING_DIRNAME}/{STAGING_SCRIPT_NAME}", "lb build"]
                 )
             )
-        return 0
 
-    scratch: str | None = None
-    project: Path | None = None
-    log_path: Path | None = None
+    def config_command(self) -> list[str]:
+        return lb_config_command(
+            release=self.release,
+            architecture=self.architecture,
+            name=self.name,
+            compression=self.compression,
+            with_firmware=self.with_firmware,
+        )
+
+
+def decide(args: argparse.Namespace) -> Plan:
+    """Turn parsed arguments into a :class:`Plan`, rejecting bad ones before any work.
+
+    Raises :class:`BuildError` with the exit code 2 convention of the CLI: the whole
+    point is to fail on a typo rather than after a twenty-minute build.
+    """
+    name = args.name.strip()
+    if not name or any(char in name for char in "\r\n\0"):
+        raise BuildError("--name must be a non-empty, single-line name")
+    if not RELEASE_RE.match(args.release):
+        raise BuildError(f"invalid --release {args.release!r}")
+    if args.release not in KNOWN_RELEASES:
+        print_warning(
+            f"{args.release!r} is not a known Debian suite ({', '.join(KNOWN_RELEASES)}); live-build may reject it"
+        )
+    if args.boot_timeout <= 0:
+        raise BuildError("--boot-timeout must be a positive number of seconds")
+    if args.cache_dir is not None and args.container == "never":
+        raise BuildError("--cache-dir only applies to Docker builds")
+
     try:
-        if args.work_dir:
-            workspace = args.work_dir.expanduser().resolve()
-            workspace.mkdir(parents=True, exist_ok=True)
+        packages = (
+            parse_packages(args.packages, args.architecture)
+            if args.packages
+            else default_packages(args.architecture)
+        )
+        copies = tuple(parse_copy_spec(spec) for spec in args.copy)
+    except BuildError as exc:
+        raise BuildError(str(exc)) from None
+
+    mode, daemon = select_engine(args)
+    output = args.output.resolve()
+    return Plan(
+        name=name,
+        hostname=sanitize_hostname(name),
+        release=args.release,
+        architecture=args.architecture,
+        packages=tuple(packages),
+        copies=copies,
+        hooks=tuple(args.hook),
+        compression=args.compression,
+        with_firmware=args.with_firmware,
+        mode=mode,
+        build_image=args.build_image,
+        daemon=daemon,
+        host_architecture=host_architecture(),
+        workspace=args.work_dir.expanduser().resolve() if args.work_dir else None,
+        output=output,
+        destination=output / f"{sanitize_hostname(name)}-{args.release}-{args.architecture}.iso",
+        log=not args.no_log,
+        cache_dir=args.cache_dir.expanduser().resolve() if args.cache_dir else None,
+        keep_work=args.keep_work,
+        skip_checks=args.skip_checks,
+        dry_run=args.dry_run,
+        quiet=args.quiet,
+        boot_test=args.boot_test,
+        boot_timeout=args.boot_timeout,
+    )
+
+
+def select_engine(args: argparse.Namespace) -> tuple[str, str | None]:
+    """Which engine will build this image, and how we know (daemon version when it answered)."""
+    """Pick ``docker`` or ``native``, explaining why neither works when that is the answer."""
+    native_usable, native_problem = native_build_ready()
+    docker_usable, docker_detail = docker_ready()
+    mode, problem = select_build_mode(args.container, native_usable, docker_usable)
+    if mode == "error" and args.dry_run:
+        print_warning(f"{problem}; showing the plan anyway (assuming a Docker build)")
+        return "docker", None
+    if mode == "error":
+        lines = [
+            f"{problem}.",
+            f"    native live-build: {native_problem or 'ready'}",
+            f"    docker: {docker_detail if not docker_usable else 'ready (' + docker_detail + ')'}",
+        ]
+        if not docker_usable and args.container != "never":
+            lines.append(
+                "    hint: install Docker Desktop (Windows/macOS) or Docker Engine (Linux), start it, then retry"
+            )
+        raise BuildError("\n".join(lines))
+    return mode, docker_detail if (mode == "docker" and docker_usable) else None
+
+
+def check_free_space(plan: Plan) -> None:
+    """Warn early: a live build that runs out of disk fails late and messily."""
+    hint = plan.workspace if plan.workspace is not None else Path(tempfile.gettempdir())
+    while not hint.exists() and hint != hint.parent:
+        hint = hint.parent  # the first existing ancestor is what has to hold the data
+    if plan.skip_checks:
+        return
+    free = free_gib(hint)
+    if free is None or free >= RECOMMENDED_FREE_GIB:
+        return
+    print_warning(
+        f"only {free:.1f} GiB free where the workspace lives; a live build usually needs "
+        f">= {RECOMMENDED_FREE_GIB} GiB. Use --work-dir to build somewhere with more space."
+    )
+
+
+@dataclass
+class Workspace:
+    """The directory a build happens in, and the rules for cleaning it up."""
+
+    root: Path
+    temporary: bool
+    keep: bool
+    log: bool
+    log_path: Path | None = None
+
+    @property
+    def project(self) -> Path:
+        return self.root / "live-os"
+
+    @classmethod
+    def create(cls, plan: Plan) -> Workspace:
+        if plan.workspace is not None:
+            plan.workspace.mkdir(parents=True, exist_ok=True)
+            workspace = cls(root=plan.workspace, temporary=False, keep=plan.keep_work, log=plan.log)
         else:
-            scratch = tempfile.mkdtemp(prefix="os-maker-")
-            workspace = Path(scratch).resolve()
-        project = workspace / "live-os"
-        project.mkdir(parents=True, exist_ok=True)
-        for stale in project.glob("*.iso"):
+            workspace = cls(
+                root=Path(tempfile.mkdtemp(prefix="os-maker-")).resolve(),
+                temporary=True,
+                keep=plan.keep_work,
+                log=plan.log,
+            )
+        workspace.project.mkdir(parents=True, exist_ok=True)
+        for stale in workspace.project.glob("*.iso"):
             stale.unlink()  # never ship an ISO from a previous run
-        log_path = None if args.no_log else workspace / "build.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        output.mkdir(parents=True, exist_ok=True)
+        workspace.log_path = workspace.root / "build.log" if workspace.log else None
+        if workspace.log_path is not None:
+            workspace.log_path.parent.mkdir(parents=True, exist_ok=True)
+        return workspace
 
-        print_step(f"Preparing build context in {project}")
-        for note in stage_project(
-            project, packages=packages, hostname=hostname, copies=copies, hooks=args.hook
-        ):
-            print(f"    + {note}")
+    def close(self) -> None:
+        """Keep the workspace when asked; otherwise drop only what we created ourselves."""
+        if self.keep:
+            print(f"Build workspace kept at: {self.project}")
+        elif self.temporary:  # never delete a directory the user pointed us at
+            shutil.rmtree(self.root, ignore_errors=True)
 
-        echo = not args.quiet
+
+def stage(workspace: Workspace, plan: Plan) -> None:
+    """Write the os-maker staging directory and clear it out of the way of ``lb``."""
+    print_step(f"Preparing build context in {workspace.project}")
+    for note in stage_project(
+        workspace.project,
+        packages=list(plan.packages),
+        hostname=plan.hostname,
+        copies=list(plan.copies),
+        hooks=list(plan.hooks),
+    ):
+        print(f"    + {note}")
+
+
+def execute(workspace: Workspace, plan: Plan) -> CommandResult:
+    """Run the build itself, streaming its output and log."""
+    echo = not plan.quiet
+    config_command = plan.config_command()
+    if plan.mode == "native":
+        result = run(config_command, cwd=workspace.project, log_path=workspace.log_path, echo=echo)
+        if not result.ok:
+            raise BuildError(
+                f"lb config failed (exit code {result.returncode}):\n    " + "\n    ".join(result.tail[-5:])
+            )
+        run(
+            ["bash", f"{STAGING_DIRNAME}/{STAGING_SCRIPT_NAME}"],
+            cwd=workspace.project,
+            log_path=workspace.log_path,
+            echo=echo,
+        )
+        return run(["lb", "build"], cwd=workspace.project, log_path=workspace.log_path, echo=echo)
+    return run(
+        docker_run_command(
+            workspace=workspace.root,
+            build_image=plan.docker_image,
+            script=docker_setup_script(config_command),
+            host_architecture=plan.host_architecture,
+            target_architecture=plan.architecture,
+            cache_dir=plan.cache_dir,
+        ),
+        cwd=workspace.root,
+        log_path=workspace.log_path,
+        echo=echo,
+    )
+
+
+def collect(workspace: Workspace, plan: Plan, iso: Path, digest: str) -> None:
+    """Put the ISO, its checksum and the log next to each other in the output directory."""
+    shutil.copy2(iso, plan.destination)
+    plan.destination.with_suffix(plan.destination.suffix + ".sha256").write_text(
+        f"{digest}  {plan.destination.name}\n", encoding="utf-8"
+    )
+    if workspace.log_path is not None and workspace.log_path.is_file():
+        shutil.copy2(workspace.log_path, plan.destination.with_suffix(plan.destination.suffix + ".log"))
+
+
+def report(plan: Plan, digest: str) -> None:
+    size_gib = plan.destination.stat().st_size / 1024**3
+    tick = "\033[1;32m" if colour_supported() else ""
+    reset = "\033[0m" if tick else ""
+    print(f"\n{tick}Bootable ISO created:{reset} {plan.destination} ({size_gib:.2f} GiB)")
+    print(f"SHA-256: {digest}")
+    print("Test it in a virtual machine before writing it to hardware, e.g.:")
+    print(f"    qemu-system-x86_64 -cdrom {plan.destination.name} -m 2048 -boot d")
+    print(
+        "Write it to a USB stick with balenaEtcher, Rufus, or: dd if=<iso> of=/dev/sdX bs=4M status=progress"
+    )
+
+
+def run_build(plan: Plan) -> int:
+    """The whole build, from an empty workspace to a finished ISO."""
+    plan.output.mkdir(parents=True, exist_ok=True)
+    workspace = Workspace.create(plan)
+    try:
+        stage(workspace, plan)
         # mtime can be truncated to whole seconds on some filesystems, so give the
         # "is this ISO fresh?" check a little grace (stale ISOs were deleted above).
         build_started = time.time() - 2
-        if mode == "native":
-            result = run(config_command, cwd=project, log_path=log_path, echo=echo)
-            if not result.ok:
-                raise BuildError(
-                    f"lb config failed (exit code {result.returncode}):\n    "
-                    + "\n    ".join(result.tail[-5:])
-                )
-            run(
-                ["bash", f"{STAGING_DIRNAME}/{STAGING_SCRIPT_NAME}"],
-                cwd=project,
-                log_path=log_path,
-                echo=echo,
-            )
-            result = run(["lb", "build"], cwd=project, log_path=log_path, echo=echo)
-        else:
-            result = run(
-                docker_run_command(
-                    workspace=workspace,
-                    build_image=build_image_for(args.release, args.build_image),
-                    script=docker_setup_script(config_command),
-                    host_architecture=machine_arch,
-                    target_architecture=args.architecture,
-                    cache_dir=cache_dir,
-                ),
-                cwd=workspace,
-                log_path=log_path,
-                echo=echo,
-            )
+        result = execute(workspace, plan)
         if not result.ok:
             raise BuildError(
                 f"build failed (exit code {result.returncode}):\n    " + "\n    ".join(result.tail[-15:])
             )
-
         print_step("Collecting the image")
-        iso = find_iso(project, not_older_than=build_started)
-        shutil.copy2(iso, destination)
-        digest = sha256_of(destination)
-        destination.with_suffix(destination.suffix + ".sha256").write_text(
-            f"{digest}  {destination.name}\n", encoding="utf-8"
-        )
-        if log_path is not None and log_path.is_file():
-            shutil.copy2(log_path, destination.with_suffix(destination.suffix + ".log"))
-
+        iso = find_iso(workspace.project, not_older_than=build_started)
+        digest = sha256_of(iso)
+        collect(workspace, plan, iso, digest)
         if (
-            mode == "docker"
-            and args.work_dir
+            plan.mode == "docker"
+            and plan.workspace is not None
             and platform.system() == "Linux"
             and getattr(os, "geteuid", lambda: 0)() != 0
         ):
             print_warning(
-                f"files in {workspace} were created by root inside the container; "
-                f"clean them up with: sudo rm -rf {project}"
+                f"files in {workspace.root} were created by root inside the container; "
+                f"clean them up with: sudo rm -rf {workspace.project}"
             )
-        size_gib = destination.stat().st_size / 1024**3
-        tick = "\033[1;32m" if colour_supported() else ""
-        reset = "\033[0m" if tick else ""
-        print(f"\n{tick}Bootable ISO created:{reset} {destination} ({size_gib:.2f} GiB)")
-        print(f"SHA-256: {digest}")
-        print("Test it in a virtual machine before writing it to hardware, e.g.:")
-        print(f"    qemu-system-x86_64 -cdrom {destination.name} -m 2048 -boot d")
-        print(
-            "Write it to a USB stick with balenaEtcher, Rufus, or: dd if=<iso> of=/dev/sdX bs=4M status=progress"
-        )
-        if args.boot_test:
-            return qemu_boot_test(destination, args.architecture, args.boot_timeout, log_path=log_path)
+        report(plan, digest)
+        if plan.boot_test:
+            return qemu_boot_test(
+                plan.destination, plan.architecture, plan.boot_timeout, log_path=workspace.log_path
+            )
         return 0
+    finally:
+        workspace.close()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        plan = decide(args)
     except BuildError as exc:
         print(f"os-maker: {exc}", file=sys.stderr)
-        if not args.keep_work and not args.work_dir:
+        return 2
+
+    plan.announce()
+    check_free_space(plan)
+    if plan.dry_run:
+        plan.describe()
+        return 0
+    try:
+        return run_build(plan)
+    except BuildError as exc:
+        print(f"os-maker: {exc}", file=sys.stderr)
+        if plan.workspace is None and not plan.keep_work:
             print(
                 "os-maker: the workspace was deleted; re-run with --keep-work to inspect it", file=sys.stderr
             )
@@ -855,14 +1005,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as exc:
         print(f"os-maker: {exc}", file=sys.stderr)
         return 1
-    finally:
-        if scratch is not None:
-            if args.keep_work:
-                print(f"Build workspace kept at: {Path(scratch).resolve() / 'live-os'}")
-            else:
-                shutil.rmtree(scratch, ignore_errors=True)
-        elif args.keep_work and project is not None:
-            print(f"Build workspace kept at: {project}")
 
 
 if __name__ == "__main__":

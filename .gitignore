@@ -17,6 +17,10 @@ os_maker_data.json.tmp
 
 # Tooling caches
 unittest.log
+.coverage
+.coverage.*
+coverage.txt
+htmlcov/
 
 .ruff_cache/
 .pytest_cache/
