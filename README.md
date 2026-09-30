@@ -142,7 +142,7 @@ pipe too.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t .      # 206 tests, stdlib only, no Docker/network needed
+python3 -m unittest discover -s tests -t .      # 216 tests, stdlib only, no Docker/network needed
 python3 -m compileall -q build_os.py os_maker.py
 
 pip install ruff mypy "coverage[toml]"           # the three gates CI also runs
@@ -156,10 +156,13 @@ save file, `TinyOS` for the shell (expansion, dispatch, history), then readline 
 everything into a `Plan` first and only then runs `Workspace` → `stage` → `execute` → `collect` → `report`, so a bad
 flag never survives to minute twenty of a build.
 
-The suite covers the shell's lexer, path handling and every built-in, plus the builder's validation, command
-assembly, staging tree and — through a stub `lb` — the complete build → ISO → checksum → log pipeline and the QEMU
-boot test (93% branch coverage; CI fails below 85%). CI (`.github/workflows/ci.yml`) lints, type-checks, runs the
-tests on Linux/macOS/Windows for Python 3.10 and 3.12, and on pushes to `main` also builds a minimal ISO in Docker
-and boots it in QEMU.
+The suite covers the shell's lexer, path handling and every built-in (including the error text each command gives
+on bad input), plus the builder's validation, engine probing, command assembly, staging tree and — through a stub
+`lb` — the complete build → ISO → checksum → log pipeline and the QEMU boot test. Branch coverage is 96%
+(`build_os.py` 99%, `os_maker.py` 95%).
+
+CI (`.github/workflows/ci.yml`) runs four gates: ruff lint + format, `mypy --strict`, the tests on
+Linux/macOS/Windows for Python 3.10 and 3.12, and a coverage job that fails below 90% so the number can only go
+up. On pushes to `main` it also builds a minimal ISO in Docker and boots it in QEMU.
 
 Both scripts are single files with `--help` for every flag; nothing else needs to be installed.
