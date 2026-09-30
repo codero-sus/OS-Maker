@@ -33,11 +33,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: Environment
+        run: python -c "import shutil,sys,tempfile;print(sys.platform, sys.version.split()[0], tempfile.gettempdir(), shutil.which('bash'))"
       - name: Byte-compile both scripts
         run: python -m compileall -q build_os.py os_maker.py
       - name: Unit and integration tests
-        run: python -m unittest discover -s tests -t . -v
+        shell: bash
+        run: |
+          set +e
+          python -m unittest discover -s tests -t . 2>&1 | tee unittest.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" != "0" ]; then
+            # Log storage can be unreachable, so surface the failures as annotations.
+            summary=$(grep -E "^(FAIL|ERROR):" unittest.log | head -12 | sed 's/^/  /')
+            details=$(grep -E "^(FAIL|ERROR):|\*\*\*|Error:|assert" unittest.log | head -40)
+            { echo "$summary"; echo; echo "$details"; } | sed ':a;N;$!ba;s/\n/%0A/g' | sed 's/^/::error::/'
+            exit "$status"
+          fi
       - name: Shell smoke test (simulator end to end)
+        shell: bash
         run: >
           python os_maker.py --no-save --no-banner
           -e "mkdir -p /tmp/demo"
@@ -46,6 +61,7 @@ jobs:
           -e "tree /tmp/demo"
           -e "df"
       - name: Builder dry run (no Docker required)
+        shell: bash
         run: >
           python build_os.py --name "CI Test OS" --release trixie --architecture arm64
           --packages sudo,neofetch --compression zstd --dry-run

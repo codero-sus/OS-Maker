@@ -16,6 +16,8 @@ os_maker_data.json
 os_maker_data.json.tmp
 
 # Tooling caches
+unittest.log
+
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
