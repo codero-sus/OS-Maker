@@ -885,7 +885,9 @@ class PlanTests(unittest.TestCase):
 
             with unittest.mock.patch.object(build_os, "free_gib", side_effect=record), captured():
                 build_os.check_free_space(plan)
-        self.assertEqual(seen, [Path(tmp)])  # walked up to the first existing directory
+        # the plan resolves the work dir, and free space is measured on the first
+        # existing ancestor -- /private/var and the long user name on macOS/Windows
+        self.assertEqual(seen, [Path(tmp).resolve()])
 
     def test_skip_checks_silences_the_disk_warning(self) -> None:
         plan = self.plan(["--name", "Skip", "--dry-run", "--skip-checks"])
@@ -901,7 +903,7 @@ class PlanTests(unittest.TestCase):
             plan = self.plan(["--name", "Ws", "--dry-run", "--work-dir", str(root)])
             workspace = build_os.Workspace.create(plan)
             self.assertFalse((root / "live-os" / "old.iso").exists())
-            self.assertEqual(workspace.project, root / "live-os")
+            self.assertEqual(workspace.project, root.resolve() / "live-os")
             self.assertTrue(workspace.log_path is not None)
             with captured() as out:
                 workspace.close()  # a user-provided directory is simply left alone
