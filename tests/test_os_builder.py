@@ -1119,13 +1119,16 @@ class ModelTests(TempDirCase):
         run.drain()
         self.assertEqual(run.finish_code, 0, "\n".join(run.log))
         self.assertTrue(run.progress.done)
-        self.assertTrue(any("Planned build" in line for line in run.log))
+        self.assertTrue(any("Dry run" in line for line in run.log), "\n".join(run.log))
 
     def test_dry_run_through_the_model_reaches_the_real_builder(self) -> None:
         """End to end: model -> argv -> build_os.py --dry-run, which must approve the plan."""
         code, text = self.model(name="Smoke", packages=["htop"]).preview()
         self.assertEqual(code, 0, text)
-        self.assertIn("Planned build", text)
+        # Assert on what the builder prints with or without a Docker daemon: the
+        # "Planned build ..." preamble only appears when no daemon could be found.
+        self.assertIn("Dry run -- nothing was executed", text)
+        self.assertIn("mode:", text)
         self.assertIn("htop", text)
 
     def test_artifacts_come_from_the_output_directory(self) -> None:
@@ -1239,7 +1242,7 @@ class CliTests(TempDirCase):
         self.assertEqual(code, 0, box.text)
         self.assertIn("build_os.py", box.stdout)
         self.assertIn("--dry-run", box.stdout)
-        self.assertIn("Planned build", box.stdout)
+        self.assertIn("Dry run", box.stdout)
         self.assertIn("branded files", box.stdout)
 
     def test_preview_passes_through_a_failing_plan(self) -> None:
@@ -2281,12 +2284,13 @@ class GuiTests(TempDirCase):
     def test_dry_run_reports_what_the_builder_says(self) -> None:
         with fake_tkinter() as env:
             gui = env["gui"].BuilderGUI(model=self.model())
-            with unittest.mock.patch.object(
-                gui.model, "preview", return_value=(0, "Planned build inside debian:trixie")
-            ):
+            plan = "==> Dry run -- nothing was executed\n    mode:       docker\n    packages:   linux-image-amd64, htop"
+            with unittest.mock.patch.object(gui.model, "preview", return_value=(0, plan)) as preview:
                 gui._dry_run()
+            self.assertTrue(preview.called)
             joined = "".join(str(item[1]) for item in gui.log.inserts)
-            self.assertIn("Planned build inside debian:trixie", joined)
+            self.assertIn("Dry run -- nothing was executed", joined)
+            self.assertIn("mode:       docker", joined)
             self.assertIn("exited 0", joined)
             self.assertEqual(gui.preview_button.configured.get("state"), "normal")
             gui._on_close()
