@@ -1,0 +1,31 @@
+{
+  "name": "Aurora Desktop",
+  "tagline": "a desktop that gets out of your way",
+  "hostname": "aurora-desktop",
+  "motd": "Welcome to Aurora Desktop.\na desktop that gets out of your way\n\nEvery package here was chosen deliberately. Enjoy it.\n",
+  "release": "trixie",
+  "architecture": "amd64",
+  "preset": "desktop",
+  "packages": [
+    "firefox-esr",
+    "vlc",
+    "gimp"
+  ],
+  "files": [],
+  "hooks": [],
+  "compression": "zstd",
+  "with_firmware": false,
+  "with_wallpaper": true,
+  "container": "auto",
+  "boot_test": false,
+  "keep_work": false,
+  "skip_checks": false,
+  "accent": "#4f9cf9",
+  "wallpaper_style": "gradient",
+  "wallpaper_size": "1920x1080",
+  "output_dir": "",
+  "work_dir": "",
+  "cache_dir": "",
+  "notes": "Built as a demo of what OS Builder produces: a full desktop with three extra apps.",
+  "recipe_version": 1
+}

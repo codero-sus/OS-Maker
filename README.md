@@ -1,15 +1,17 @@
 # OS Maker — build your own bootable Linux, and play with a mini OS
 
-This repository holds two independent Python programs (no third-party dependencies, Python 3.10+):
+This repository holds three independent Python programs (no third-party dependencies, Python 3.10+):
 
 | File | What it does |
 | --- | --- |
+| [`os_builder.py`](os_builder.py) + [`os_builder_gui.py`](os_builder_gui.py) | A **graphical OS builder**: pick a name, a look, packages and files, press a button, get a bootable ISO. |
 | [`build_os.py`](build_os.py) | Builds a **real bootable Debian-based live ISO** on Linux, macOS and Windows. |
 | [`os_maker.py`](os_maker.py) | A **mini operating-system simulator**: a shell and a persistent virtual filesystem that runs anywhere Python does. |
 
 ```bash
-python3 build_os.py --name MyOS                 # -> dist/myos-bookworm-amd64.iso (+ .sha256 and build log)
-python3 os_maker.py                             # -> interactive mini shell, saved to os_maker_data.json
+python3 os_builder.py                             # -> the GUI: design an OS, build it, watch the log
+python3 build_os.py --name MyOS                   # -> dist/myos-bookworm-amd64.iso (+ .sha256 and build log)
+python3 os_maker.py                               # -> interactive mini shell, saved to os_maker_data.json
 ```
 
 ---
@@ -139,17 +141,111 @@ pipe too.
 
 ---
 
+## 3. `os_builder.py` — a graphical OS builder
+
+A window, a recipe, and a real ISO. `os_builder.py` is the design studio on top of
+`build_os.py`: you choose what the machine is called, what it looks like and what is in it, and
+it generates the artwork and runs the actual build.
+
+```bash
+python3 os_builder.py                       # the GUI (needs Tk, see below)
+python3 os_builder.py --preset gaming       # start the GUI from a preset
+python3 os_builder.py -r examples/aurora-desktop.json
+```
+
+![the five wallpaper styles the builder can generate](docs/wallpaper-styles.png)
+
+Those five wallpapers are the `gradient`, `sunset`, `rays`, `grid` and `waves` styles, each rendered by
+`os_builder.py` itself with `zlib` and `struct` — no Pillow, no templates, no image files to edit. To
+regenerate the banner:
+
+```bash
+for style in gradient sunset rays grid waves; do
+  python3 -c "import os_builder as ob; ob.render_wallpaper_png(
+      ob.Recipe(name='Neon Arcade', tagline='thirty years of games, one reboot',
+                wallpaper_style='$style', accent='#4f9cf9'),
+      '/tmp/$style.png', width=320, height=180)"
+done   # then tile the five files with any image tool
+```
+
+### What you can set
+
+| Tab | Controls |
+| --- | --- |
+| identity | product name, tagline, hostname, `/etc/motd`, notes, Debian release/architecture/compression/container mode |
+| software | preset, the effective package list, ~25 tickable suggestions, your own additions, firmware switch |
+| appearance | accent colour (7 swatches or any hex), five wallpaper styles, resolution, and a **live preview** that redraws as you type |
+| files & hooks | files copied to a path inside the image, shell hooks live-build runs while building |
+| build | output/work/cache folders, QEMU boot test, keep-workspace, skip-checks, and a table of what the build produced with SHA-256 verification |
+
+The window adopts the accent colour of the OS you are building, so a "Neon Arcade" recipe really
+does look like one. A live log pane shows the builder's output (colour-coded, auto-scrolling,
+`Stop` available), and a dry run button prints the exact `build_os.py` command line before
+committing to a build.
+
+### Recipes
+
+A recipe is plain JSON, so it can be reviewed, versioned and reproduced without the GUI:
+
+```bash
+python3 os_builder.py --new --out my-os.json --preset server   # write a starter recipe
+python3 os_builder.py --check my-os.json                        # validate it (exit 0 = buildable)
+python3 os_builder.py --preview my-os.json                       # argv + the builder's dry-run plan
+python3 os_builder.py --build my-os.json                         # build it with no GUI at all
+python3 os_builder.py --wallpaper my-os.json --out wp.png        # just the generated artwork
+python3 os_builder.py --list-presets
+```
+
+```json
+{
+  "name": "Neon Arcade",
+  "tagline": "thirty years of games, one reboot",
+  "preset": "gaming",
+  "packages": ["fceux", "mame-tools"],
+  "accent": "#bc8cff",
+  "wallpaper_style": "rays",
+  "with_firmware": true,
+  "files": ["banner.txt:/etc/issue.net"]
+}
+```
+
+Three ready-made recipes live in [`examples/`](examples) and CI checks all of them. Relative paths in
+`files` resolve against the recipe's own folder, so an example stays portable.
+
+### How it is put together
+
+The GUI never reimplements the build. `RecipeModel` holds the state, `make_branding()` generates the
+wallpaper/motd/issue/`os-release` plus a live-build hook, and `BuildRun` runs `build_os.py` as a
+subprocess with the flags the recipe describes — which is exactly what `--build` does from a
+terminal. That means:
+
+* the same recipe works headless, in CI and over SSH, where there is no display;
+* `build_os.py` keeps a single supported entry point, so nothing can drift between the two;
+* the GUI is a thin view: 93% of it is covered by tests that run without Tk, using a small fake
+  `tkinter`. Progress comes from live-build's own stage markers and apt's percentages, so the bar
+  means something rather than spinning.
+
+**Needs Tk 8.6** (for PNG previews). Debian/Ubuntu: `sudo apt install python3-tk`; macOS: `brew install
+python-tk`; Windows: reinstall Python with *tcl/tk and IDLE* ticked. Without it the GUI says so and
+points at `--preview` / `--build`, which need nothing extra.
+
+---
+
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t .      # 216 tests, stdlib only, no Docker/network needed
-python3 -m compileall -q build_os.py os_maker.py
+python3 -m unittest discover -s tests -t .      # 406 tests, stdlib only, no Docker/network needed
+python3 -m compileall -q build_os.py os_maker.py os_builder.py os_builder_gui.py
 
 pip install ruff mypy "coverage[toml]"           # the three gates CI also runs
 ruff check . && ruff format --check .
 python3 -m mypy                                  # --strict, configured in pyproject.toml
 python3 -m coverage run -m unittest discover -s tests -t . && python3 -m coverage report
 ```
+
+The four programs are deliberately layered: `os_builder_gui.py` only draws widgets and
+`os_builder.py` holds every decision (recipe, validation, branding, argv, progress) so the GUI is
+testable without a display; `RecipeModel` is the whole application.
 
 `os_maker.py` is layered on purpose: `lex`/`parse` for the command line, `FileSystem` for the node tree and the
 save file, `TinyOS` for the shell (expansion, dispatch, history), then readline and the CLI. `build_os.py` decides
@@ -159,7 +255,7 @@ flag never survives to minute twenty of a build.
 The suite covers the shell's lexer, path handling and every built-in (including the error text each command gives
 on bad input), plus the builder's validation, engine probing, command assembly, staging tree and — through a stub
 `lb` — the complete build → ISO → checksum → log pipeline and the QEMU boot test. Branch coverage is 96%
-(`build_os.py` 99%, `os_maker.py` 95%).
+(`build_os.py` 99%, `os_builder.py` 97%, `os_builder_gui.py` 93%, `os_maker.py` 95%).
 
 CI (`.github/workflows/ci.yml`) runs four gates: ruff lint + format, `mypy --strict`, the tests on
 Linux/macOS/Windows for Python 3.10 and 3.12, and a coverage job that fails below 90% so the number can only go
