@@ -1,0 +1,33 @@
+{
+  "name": "Rescue Stick",
+  "tagline": "boot it, fix it, hand it back",
+  "hostname": "rescue-stick",
+  "motd": "Welcome to Rescue Stick.\nboot it, fix it, hand it back\n\nEvery package here was chosen deliberately. Enjoy it.\n",
+  "release": "trixie",
+  "architecture": "amd64",
+  "preset": "server",
+  "packages": [
+    "gddrescue",
+    "ddrescue",
+    "nmap"
+  ],
+  "files": [
+    "banner.txt:/etc/issue.net"
+  ],
+  "hooks": [],
+  "compression": "xz",
+  "with_firmware": true,
+  "with_wallpaper": true,
+  "container": "auto",
+  "boot_test": false,
+  "keep_work": false,
+  "skip_checks": false,
+  "accent": "#f78166",
+  "wallpaper_style": "grid",
+  "wallpaper_size": "1920x1080",
+  "output_dir": "",
+  "work_dir": "",
+  "cache_dir": "",
+  "notes": "Firmware on, xz compression for a smaller stick, and a login banner.",
+  "recipe_version": 1
+}

@@ -1,0 +1,30 @@
+{
+  "name": "Neon Arcade",
+  "tagline": "thirty years of games, one reboot",
+  "hostname": "neon-arcade",
+  "motd": "Welcome to Neon Arcade.\nthirty years of games, one reboot\n\nEvery package here was chosen deliberately. Enjoy it.\n",
+  "release": "trixie",
+  "architecture": "amd64",
+  "preset": "gaming",
+  "packages": [
+    "fceux",
+    "mame-tools"
+  ],
+  "files": [],
+  "hooks": [],
+  "compression": "zstd",
+  "with_firmware": true,
+  "with_wallpaper": true,
+  "container": "auto",
+  "boot_test": false,
+  "keep_work": false,
+  "skip_checks": false,
+  "accent": "#bc8cff",
+  "wallpaper_style": "rays",
+  "wallpaper_size": "1920x1080",
+  "output_dir": "",
+  "work_dir": "",
+  "cache_dir": "",
+  "notes": "A live arcade: boots, plays, leaves no trace.",
+  "recipe_version": 1
+}

@@ -1,0 +1,2 @@
+  This machine was built by OS Builder.
+  Nothing here is installed on the disk unless you ask for it.

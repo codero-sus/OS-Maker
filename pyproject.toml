@@ -18,7 +18,7 @@ ignore = ["E501", "RUF001", "RUF002", "RUF003", "RET504"]
 # the config lives here so `python3 -m mypy` / `python3 -m coverage` need no flags.
 [tool.mypy]
 python_version = "3.10"
-files = ["build_os.py", "os_maker.py"]
+files = ["build_os.py", "os_maker.py", "os_builder.py", "os_builder_gui.py"]
 strict = true
 
 [[tool.mypy.overrides]]
@@ -26,9 +26,15 @@ strict = true
 module = ["readline.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# tkinter's own API is only partially annotated, so a few calls into it are untyped
+# by definition; strict mode still applies to everything we wrote.
+module = ["os_builder_gui"]
+disallow_untyped_calls = false
+
 [tool.coverage.run]
 branch = true
-source = ["build_os", "os_maker"]
+source = ["build_os", "os_maker", "os_builder", "os_builder_gui"]
 
 [tool.coverage.report]
 skip_covered = false
