@@ -333,8 +333,12 @@ class HelperTests(unittest.TestCase):
                 os_builder.absolutise("note.txt:/etc/note.txt", base),
                 f"{(base / 'note.txt').as_posix()}:/etc/note.txt",
             )
+            # a source that is already absolute is left alone apart from separators:
+            # absolutise always emits the portable POSIX spelling, which is what
+            # build_os.py accepts on every platform (Windows too)
             already = os_builder.absolutise(f"{base / 'note.txt'}:/etc/x", base)
-            self.assertTrue(already.startswith(f"{base / 'note.txt'}:"))
+            self.assertTrue(already.startswith(f"{(base / 'note.txt').as_posix()}:"))
+            self.assertEqual(already.rpartition(":")[2], "/etc/x")
             self.assertEqual(
                 os_builder.absolutise("sub/../note.txt:/x", base), f"{(base / 'note.txt').as_posix()}:/x"
             )
@@ -1059,7 +1063,11 @@ class ModelTests(TempDirCase):
     def test_argv_includes_generated_branding(self) -> None:
         argv = self.model(packages=["htop"]).argv()
         self.assertIn("--packages", argv)
-        destinations = [argv[i + 1].partition(":")[2] for i, item in enumerate(argv) if item == "--copy"]
+        # rpartition, like build_os.parse_copy_spec: a Windows source can hold a drive
+        # letter ("C:/..."), so the destination is whatever follows the *last* colon
+        copies = [argv[i + 1] for i, item in enumerate(argv) if item == "--copy"]
+        destinations = [copy.rpartition(":")[2] for copy in copies]
+        self.assertEqual(len(copies), 4, "wallpaper, motd, issue, os-release")
         self.assertIn("/etc/motd", destinations)
         self.assertIn("/usr/share/backgrounds/os-maker.png", destinations)
         self.assertNotIn("--dry-run", argv)
