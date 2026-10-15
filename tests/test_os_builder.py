@@ -287,6 +287,326 @@ class ValidationTests(TempDirCase):
         self.assertEqual(recipe.problems(), [])
 
 
+class SystemFieldTests(TempDirCase):
+    """The settings that reach the machine through the branding hook, not the CLI."""
+
+    def test_the_recipe_carries_the_new_fields(self) -> None:
+        recipe = self.recipe(
+            version="2.1",
+            author="Ada",
+            home_url="https://aurora.example",
+            locale="en_GB.UTF-8",
+            keyboard="gb",
+            timezone="Europe/London",
+            kernel="cloud",
+            grub_timeout=0,
+            picture_options="centered",
+            wallpaper_seed=42,
+            show_wordmark=False,
+            motd_art=True,
+            apt_sources=["deb https://deb.debian.org/debian trixie main"],
+            remove_packages=["gnome-music"],
+        )
+        self.assertEqual(recipe.problems(), [])
+        restored = os_builder.Recipe.from_json(recipe.to_json())
+        self.assertEqual(restored.as_dict(), recipe.as_dict(), "every new field survives JSON")
+        self.assertEqual(restored.wallpaper_seed, 42)
+        self.assertFalse(restored.show_wordmark)
+
+    def test_the_defaults_are_unchanged_for_an_old_recipe(self) -> None:
+        """A recipe written before these fields existed must still mean the same thing."""
+        recipe = os_builder.Recipe.from_dict({"name": "Old", "preset": "desktop"})
+        self.assertEqual(recipe.locale, "")
+        self.assertEqual(recipe.kernel, "auto")
+        self.assertEqual(recipe.grub_timeout, 5)
+        self.assertTrue(recipe.show_wordmark)
+        self.assertTrue(recipe.with_branding_record)
+        self.assertEqual(recipe.merged_packages(), list(os_builder.PRESETS["desktop"].packages))
+
+    def test_nonsense_values_are_named(self) -> None:
+        cases = (
+            ({"locale": "english"}, "locale 'english' must be like en_GB.UTF-8"),
+            ({"locale": "en-GB"}, "locale 'en-GB' must be like en_GB.UTF-8"),
+            ({"keyboard": "GB"}, "keyboard 'GB' must be a console keymap"),
+            ({"timezone": "London"}, "timezone 'London' must be like Europe/London"),
+            ({"timezone": "../../etc/passwd"}, "timezone '../../etc/passwd' must be like Europe/London"),
+            ({"kernel": "lto"}, "kernel 'lto' must be one of auto, generic, cloud, realtime, none"),
+            ({"grub_timeout": -1}, "boot menu timeout must be a whole number of seconds between 0 and 120"),
+            ({"grub_timeout": 900}, "boot menu timeout must be a whole number of seconds between 0 and 120"),
+            ({"picture_options": "fill"}, "background fit 'fill' must be one of"),
+            ({"version": "two point oh"}, "version 'two point oh' must be short and shell-safe"),
+            ({"author": "a" * 90}, "the author line has to fit on one line"),
+            ({"home_url": "aurora.example"}, "home URL 'aurora.example' must be a full http(s) URL"),
+            ({"home_url": "https://a b"}, "home URL 'https://a b' must be a full http(s) URL"),
+            (
+                {"apt_sources": ["deb http://x trixie"]},
+                "apt source 'deb http://x trixie' must be one 'deb https://host suite component' line",
+            ),
+            (
+                {"apt_sources": ["rm -rf /"]},
+                "apt source 'rm -rf /' must be one 'deb https://host suite component' line",
+            ),
+            ({"remove_packages": ["not a name"]}, "'not a name' is not a valid Debian package name"),
+        )
+        for changes, expected in cases:
+            with self.subTest(**changes):
+                problems = self.recipe(**changes).problems()
+                self.assertIn(expected, "\n".join(problems), msg=str(problems))
+
+    def test_a_tiny_wallpaper_size_says_so_exactly(self) -> None:
+        self.assertIn(
+            "must be between 64x64 and 4096x4096",
+            "\n".join(self.recipe(wallpaper_size="32x20").problems()),
+        )
+        self.assertIn("must look like 1920x1080", "\n".join(self.recipe(wallpaper_size="huge").problems()))
+
+    def test_the_wrong_type_of_every_new_field_is_refused(self) -> None:
+        for payload, fragment in (
+            ({"locale": 1}, "'locale' must be a string"),
+            ({"apt_sources": "deb http://x y z"}, "'apt_sources' must be a list of strings"),
+            ({"remove_packages": [2]}, "'remove_packages' must be a list of strings"),
+            ({"show_wordmark": "yes"}, "'show_wordmark' must be true or false"),
+            ({"motd_art": 1}, "'motd_art' must be true or false"),
+            ({"wallpaper_seed": "big"}, "'wallpaper_seed' must be a whole number"),
+            ({"grub_timeout": "5"}, "'grub_timeout' must be a whole number of seconds"),
+        ):
+            with self.subTest(payload=payload), self.assertRaises(os_builder.RecipeError) as caught:
+                os_builder.Recipe.from_dict(payload)
+            self.assertIn(fragment, str(caught.exception))
+
+    def test_the_kernel_becomes_a_package(self) -> None:
+        self.assertEqual(os_builder.recipe_to_argv(self.recipe(kernel="auto")).count("--packages"), 1)
+        self.assertNotIn("linux-image", " ".join(self.recipe(kernel="auto").merged_packages()))
+        cloud = self.recipe(kernel="cloud").merged_packages()
+        self.assertEqual(
+            cloud[0], "linux-image-cloud-amd64", "the kernel leads, so it is never de-duped away"
+        )
+        arm = self.recipe(architecture="arm64", kernel="realtime").merged_packages()
+        self.assertEqual(arm[0], "linux-image-rt-arm64")
+        self.assertEqual(self.recipe(kernel="none").merged_packages(), self.recipe().merged_packages())
+
+    def test_os_release_uses_the_recipes_own_identity(self) -> None:
+        recipe = self.recipe(name="Aurora", version="2.1", author="Ada", home_url="https://aurora.example")
+        text = os_builder.os_release_text(recipe)
+        self.assertIn('PRETTY_NAME="Aurora 2.1"', text)
+        self.assertIn('VERSION_ID="2.1"', text)
+        self.assertIn('HOME_URL="https://aurora.example"', text)
+        self.assertIn('SUPPORT_URL="https://aurora.example"', text)
+        self.assertIn('OS_MAKER_MAINTAINER="Ada"', text)
+        default = os_builder.os_release_text(self.recipe())
+        self.assertIn(f'HOME_URL="{os_builder.DEFAULT_HOME_URL}"', default, "blank keeps the project URL")
+        self.assertIn('PRETTY_NAME="', default)
+        self.assertNotIn("OS_MAKER_MAINTAINER", default)
+
+    def test_the_branding_record_is_a_machine_readable_card(self) -> None:
+        recipe = self.recipe(name="Aurora", version="3")
+        record = json.loads(recipe.branding_record)
+        self.assertEqual(record["name"], "Aurora")
+        self.assertEqual(record["version"], "3")
+        self.assertEqual(record["hostname"], recipe.resolved_hostname)
+        self.assertEqual(record["recipe_digest"], recipe.digest())
+        self.assertIn("os_builder.py", record["builder"])
+        self.assertFalse(any("\n" in json.dumps(record) and key == "nope" for key in record))
+
+    def test_the_digest_is_stable_and_settings_sensitive(self) -> None:
+        first = self.recipe(name="Same", packages=["htop"])
+        same = self.recipe(name="Same", packages=["htop"])
+        different = self.recipe(name="Same", packages=["vim"])
+        self.assertEqual(first.digest(), same.digest())
+        self.assertNotEqual(first.digest(), different.digest())
+        self.assertRegex(first.digest(), r"^[0-9a-f]{64}$")
+        saved = self.tmp / "r.json"
+        first.save(saved)
+        self.assertEqual(
+            os_builder.Recipe.from_file(saved).digest(), first.digest(), "a saved recipe is itself"
+        )
+
+    def test_make_branding_writes_the_record_only_when_asked(self) -> None:
+        off = os_builder.make_branding(self.recipe(with_branding_record=False), self.tmp / "b")
+        self.assertIsNone(off.record)
+        self.assertFalse((self.tmp / "b" / "os-maker.json").exists())
+        self.assertNotIn("/etc/os-maker.json", off.hook.read_text(encoding="utf-8"))
+
+
+class HookExecutionTests(TempDirCase):
+    """Run the generated hook in a fake root, with a fake apt-get on PATH.
+
+    Reading the script is not proof: these tests execute it and read what came out.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._roots = 0
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        self.calls = self.tmp / "apt-get.log"
+        fake = self.bin / "apt-get"
+        fake.write_text(
+            '#!/bin/sh\nprintf \'%s\\n\' "$@" >> "$APT_LOG"\nexit 0\n',
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        for name in ("locale-gen", "grub-mkconfig", "dconf"):
+            stub = self.bin / name
+            stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            stub.chmod(0o755)
+
+    def run_hook(
+        self, recipe: os_builder.Recipe, *, with_desktop: bool = True, root: Path | None = None
+    ) -> tuple[Path, str]:
+        """Run the generated hook against a miniature root and return that root.
+
+        Passing ``root`` again runs the hook a second time inside the same fake
+        filesystem, which is how idempotency gets checked.
+        """
+        shell = shutil.which("sh")
+        if shell is None:
+            self.skipTest("no POSIX shell on this machine")
+        self._roots += 1
+        branding = os_builder.make_branding(recipe, self.tmp / f"b-{self._roots}")
+        fresh = root is None
+        if root is None:
+            root = self.tmp / f"root-{self._roots}"
+        assert root is not None
+        if fresh:
+            (root / "usr/share/backgrounds").mkdir(parents=True)
+            if branding.wallpaper is not None:
+                shutil.copy2(branding.wallpaper, root / "usr/share/backgrounds/os-maker.png")
+            # a miniature of the directories a Debian rootfs has, so the guards in the
+            # hook take the same branches they would on a real image
+            (root / "etc/default").mkdir(parents=True)
+            (root / "etc/apt/sources.list.d").mkdir(parents=True)
+            (root / "etc/locale.gen").write_text("# en_GB.UTF-8 UTF-8\n", encoding="utf-8")
+            (root / "etc/default/grub").write_text(
+                "GRUB_TIMEOUT=5\nGRUB_TIMEOUT_STYLE=menu\n", encoding="utf-8"
+            )
+            # systemd-vconsole-setup is what reads /etc/vconsole.conf, so the hook
+            # only writes it where that unit could exist
+            (root / "usr/lib/systemd").mkdir(parents=True)
+            (root / "usr/share/zoneinfo/Europe").mkdir(parents=True)
+            (root / "usr/share/zoneinfo/Europe/London").write_text("LMT-0:00\n", encoding="utf-8")
+            if with_desktop:
+                (root / "etc/dconf/db/local.d").mkdir(parents=True)
+                (root / "etc/xdg/xfce4").mkdir(parents=True)
+        text = branding.hook.read_text(encoding="utf-8")
+        script = text.replace("/etc/", f"{root.name}/etc/").replace("/usr/", f"{root.name}/usr/")
+        # the fake bin goes first, so the fake apt-get wins and the host's tools
+        # (sed, cat, grep) are still found - the hook needs them
+        environment = dict(
+            os.environ,
+            PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            APT_LOG=str(self.calls),
+        )
+        completed = subprocess.run(
+            [shell, "-c", script],
+            cwd=self.tmp,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=environment,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        return root, completed.stdout
+
+    def test_the_hook_sets_the_clock_the_locale_and_the_keymap(self) -> None:
+        recipe = self.recipe(
+            name="Aurora", locale="en_GB.UTF-8", keyboard="gb", timezone="Europe/London", hostname="aurora"
+        )
+        root, _out = self.run_hook(recipe)
+        self.assertEqual((root / "etc/hostname").read_text(encoding="utf-8").strip(), "aurora")
+        self.assertEqual((root / "etc/timezone").read_text(encoding="utf-8").strip(), "Europe/London")
+        self.assertTrue((root / "etc/localtime").is_symlink(), "the zone is linked, not copied")
+        locale_default = (root / "etc/default/locale").read_text(encoding="utf-8")
+        self.assertIn("LANG=en_GB.UTF-8", locale_default)
+        generated = (root / "etc/locale.gen").read_text(encoding="utf-8")
+        self.assertIn("en_GB.UTF-8 UTF-8", generated)
+        keyboard = (root / "etc/default/keyboard").read_text(encoding="utf-8")
+        self.assertIn('XKBLAYOUT="gb"', keyboard)
+        self.assertIn("gb", (root / "etc/vconsole.conf").read_text(encoding="utf-8"))
+
+    def test_the_locale_line_is_not_added_twice(self) -> None:
+        """An idempotent hook: live-build may well run it more than once."""
+        recipe = self.recipe(name="Twice", locale="en_GB.UTF-8")
+        root, _out = self.run_hook(recipe)
+        written = lambda: [  # noqa: E731
+            line
+            for line in (root / "etc/locale.gen").read_text(encoding="utf-8").splitlines()
+            if line.startswith("en_GB.UTF-8")
+        ]
+
+        def enabled() -> int:
+            return len(written())
+
+        first = enabled()
+        _again, _out = self.run_hook(recipe, root=root)
+        self.assertEqual(first, 1, "the hook enabled the locale once")
+        self.assertEqual(enabled(), 1, "and a second run adds nothing")
+        self.assertEqual(written(), ["en_GB.UTF-8 UTF-8"], "in the syntax locale.gen expects")
+
+    def test_extra_sources_and_removals_reach_the_image(self) -> None:
+        recipe = self.recipe(
+            name="Cutter",
+            apt_sources=["deb https://deb.debian.org/debian trixie main", "deb-src http://x.example y main"],
+            remove_packages=["bluez", "gnome-music"],
+        )
+        root, _out = self.run_hook(recipe)
+        sources = (root / "etc/apt/sources.list.d/os-maker.list").read_text(encoding="utf-8")
+        self.assertIn("deb https://deb.debian.org/debian trixie main", sources)
+        self.assertIn("deb-src http://x.example y main", sources)
+        self.assertTrue(
+            (root / "etc/apt/sources.list.d/os-maker.list").stat().st_size > 0, "the file is not empty"
+        )
+        purge = self.calls.read_text(encoding="utf-8")
+        self.assertIn("purge", purge)
+        self.assertIn("bluez", purge)
+        self.assertIn("gnome-music", purge)
+        self.assertIn("--auto-remove", purge)
+
+    def test_the_boot_menu_timeout_is_written_and_hidden_at_zero(self) -> None:
+        recipe = self.recipe(name="Kiosk", grub_timeout=0)
+        root, _out = self.run_hook(recipe)
+        grub = (root / "etc/default/grub").read_text(encoding="utf-8")
+        self.assertIn("GRUB_TIMEOUT=0", grub)
+        self.assertIn("GRUB_TIMEOUT_STYLE=hidden", grub)
+        unchanged = self.recipe(name="Plain")
+        root2, _out2 = self.run_hook(unchanged)
+        self.assertEqual(
+            (root2 / "etc/default/grub").read_text(encoding="utf-8"),
+            "GRUB_TIMEOUT=5\nGRUB_TIMEOUT_STYLE=menu\n",
+            "no timeout asked for, no rewrite",
+        )
+
+    def test_the_background_fit_reaches_both_desktops(self) -> None:
+        recipe = self.recipe(name="Fit", picture_options="spanned")
+        root, _out = self.run_hook(recipe)
+        conf = (root / "etc/dconf/db/local.d/00-os-maker").read_text(encoding="utf-8")
+        self.assertIn("picture-options='spanned'", conf)
+        xml = (root / "etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('value="3"', xml, "XFCE counts its styles, it does not name them")
+
+    def test_nothing_is_invented_for_a_plain_recipe(self) -> None:
+        recipe = self.recipe(name="Bare")
+        root, out = self.run_hook(recipe)
+        self.assertIn("branding installed", out)
+        self.assertEqual(list((root / "etc/apt/sources.list.d").iterdir()), [], "no extra sources written")
+        self.assertEqual(
+            (root / "etc/default/grub").read_text(encoding="utf-8"),
+            "GRUB_TIMEOUT=5\nGRUB_TIMEOUT_STYLE=menu\n",
+        )
+        self.assertFalse(self.calls.exists(), "no removals asked for, no apt-get called")
+        self.assertTrue((root / "etc/dconf/db/local.d/00-os-maker").is_file())
+
+    def test_a_headless_image_gets_no_desktop_settings(self) -> None:
+        recipe = self.recipe(name="Headless")
+        root, out = self.run_hook(recipe, with_desktop=False)
+        self.assertIn("branding installed", out)
+        self.assertFalse((root / "etc/dconf/db/local.d/00-os-maker").exists())
+        self.assertTrue((root / "etc/hostname").is_file())
+
+
 class HelperTests(unittest.TestCase):
     def test_hostname_for_mirrors_the_builders_sanitiser(self) -> None:
         cases = {
@@ -648,9 +968,22 @@ class BrandingTests(TempDirCase):
         branding = os_builder.make_branding(self.recipe(wallpaper_size="1920x1080"), self.tmp / "b")
         self.assertEqual(
             sorted(path.name for path in (self.tmp / "b").iterdir()),
-            ["branding.hook.chroot", "issue", "motd", "os-release", "wallpaper.png"],
+            ["branding.hook.chroot", "issue", "motd", "os-maker.json", "os-release", "wallpaper.png"],
         )
-        self.assertEqual(len(branding.copies), 4)
+        self.assertEqual(
+            [destination for _source, destination in branding.copies],
+            [
+                "/usr/share/backgrounds/os-maker.png",
+                "/etc/motd",
+                "/etc/issue",
+                "/etc/os-release",
+                "/etc/os-maker.json",
+            ],
+            "the record is a copy too, so it lands wherever build_os puts copies",
+        )
+        record = json.loads((self.tmp / "b" / "os-maker.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["name"], self.recipe().name.strip())
+        self.assertEqual(len(record["recipe_digest"]), 64, "a sha256, not a hash of something else")
         self.assertEqual(branding.size, (1920, 1080))
         self.assertGreater(branding.bytes, 1000)
         for source, destination in branding.copies:
@@ -664,7 +997,8 @@ class BrandingTests(TempDirCase):
         hook_text = branding.hook.read_text(encoding="utf-8")
         self.assertNotIn("wallpaper.png", hook_text)
         self.assertNotIn("/usr/share/backgrounds", hook_text, "no wallpaper, no desktop settings")
-        self.assertEqual(len(branding.copies), 3)
+        self.assertEqual(len(branding.copies), 4, "three text files and the record")
+        self.assertIsNotNone(branding.record)
 
     def test_the_wallpaper_size_setting_is_respected(self) -> None:
         branding = os_builder.make_branding(self.recipe(wallpaper_size="160x90"), self.tmp / "b")
@@ -1186,7 +1520,7 @@ class ModelTests(TempDirCase):
         # letter ("C:/..."), so the destination is whatever follows the *last* colon
         copies = [argv[i + 1] for i, item in enumerate(argv) if item == "--copy"]
         destinations = [copy.rpartition(":")[2] for copy in copies]
-        self.assertEqual(len(copies), 4, "wallpaper, motd, issue, os-release")
+        self.assertEqual(len(copies), 5, "wallpaper, motd, issue, os-release, record")
         self.assertIn("/etc/motd", destinations)
         self.assertIn("/usr/share/backgrounds/os-maker.png", destinations)
         self.assertNotIn("--dry-run", argv)
@@ -1429,6 +1763,7 @@ class CliTests(TempDirCase):
                 self.cwd = cwd
                 self.finish_code: int | None = None
                 self.progress = os_builder.Progress()
+                self.log: list[str] = []  # a BuildRun stub owes .log too: hints read it
                 self.running = True
 
             def start(self) -> None:
@@ -1461,6 +1796,7 @@ class CliTests(TempDirCase):
                 self.argv, self.started_at = list(received), 0.0
                 self.finish_code: int | None = 0
                 self.progress = os_builder.Progress(done=True)
+                self.log: list[str] = []  # a BuildRun stub owes .log too: hints read it
                 self.running = False
 
             def start(self) -> None:
@@ -1484,6 +1820,7 @@ class CliTests(TempDirCase):
                 self.argv, self.started_at = list(argv), 0.0
                 self.finish_code: int | None = None
                 self.progress = os_builder.Progress(done=True, ok=False)
+                self.log: list[str] = []  # a BuildRun stub owes .log too: hints read it
                 self.running = True
 
             def start(self) -> None:
@@ -1507,6 +1844,7 @@ class CliTests(TempDirCase):
                 self.argv, self.started_at = list(argv), 0.0
                 self.finish_code: int | None = None
                 self.progress = os_builder.Progress()
+                self.log: list[str] = []  # a BuildRun stub owes .log too: hints read it
                 self.running = True
 
             def start(self) -> None:
@@ -1533,6 +1871,7 @@ class CliTests(TempDirCase):
                 self.running = False
                 self.finish_code: int | None = None
                 self.progress = os_builder.Progress(done=True, ok=False)
+                self.log: list[str] = []  # a BuildRun stub owes .log too: hints read it
 
             def start(self) -> None:
                 raise os_builder.RecipeError("cannot start the builder: nope")
@@ -1557,6 +1896,7 @@ class CliTests(TempDirCase):
                 self.running = True
                 self.finish_code: int | None = None
                 self.progress = os_builder.Progress()
+                self.log: list[str] = []  # a BuildRun stub owes .log too: hints read it
 
             def start(self) -> None:
                 raise KeyboardInterrupt
@@ -1851,9 +2191,11 @@ class GuiTests(TempDirCase):
     def test_the_window_is_built_from_the_model(self) -> None:
         with fake_tkinter() as env:
             gui = env["gui"].BuilderGUI(model=self.model(name="Gui OS", accent="#39d353"))
-            self.assertEqual(len(gui.notebook.pages), 5)
+            self.assertEqual(len(gui.notebook.pages), 6)
             self.assertEqual(
-                gui.notebook.pages, ["identity", "software", "appearance", "files & hooks", "build"]
+                gui.notebook.pages,
+                ["identity", "software", "system", "appearance", "files & hooks", "build"],
+                "the tabs are the manual: they must not drift",
             )
             for key in (
                 "name",
@@ -1988,6 +2330,7 @@ class GuiTests(TempDirCase):
                     self.finish_code: int | None = None
                     self.elapsed = 12.0
                     self.progress = os_builder.Progress(label="bootstrapping Debian", fraction=0.4)
+                    self.log: list[str] = []  # a BuildRun stub owes .log too: hints read it
                     self._lines = ["I: Bootstrap", "hybrid MBR"]
 
                 def drain(self, limit: int = 400) -> list[str]:
@@ -2556,6 +2899,462 @@ class RealTkTests(unittest.TestCase):
         gui._render_preview()
         self.assertTrue((Path(gui.temp_dir) / "preview.png").is_file())
         self.assertTrue(tkinter.TkVersion >= 8.6)
+
+
+class WallpaperSeedTests(TempDirCase):
+    def render(self, **fields: object) -> bytes:
+        path = self.tmp / f"pic-{abs(hash(tuple(sorted(fields.items()))))}.png"
+        os_builder.render_wallpaper_png(self.recipe(**fields), path, width=120, height=60)
+        return path.read_bytes()
+
+    def test_rolling_the_seed_rolls_the_picture(self) -> None:
+        """Seeded styles are the ones that can vary; a plain gradient has no dice to roll."""
+        for style in ("nebula", "dots", "mesh"):
+            with self.subTest(style=style):
+                self.assertNotEqual(
+                    self.render(name="Aurora", wallpaper_style=style, wallpaper_seed=1),
+                    self.render(name="Aurora", wallpaper_style=style, wallpaper_seed=2),
+                    "a new seed must look new",
+                )
+                self.assertEqual(
+                    self.render(name="Aurora", wallpaper_style=style, wallpaper_seed=1),
+                    self.render(name="Aurora", wallpaper_style=style, wallpaper_seed=1),
+                    "the same seed must look the same, on any machine",
+                )
+
+    def test_the_seed_and_style_belong_to_the_digest(self) -> None:
+        plain = self.recipe(name="Aurora")
+        for changes in ({"wallpaper_seed": 7}, {"wallpaper_style": "nebula"}, {"show_wordmark": False}):
+            with self.subTest(**changes):
+                self.assertNotEqual(plain.digest(), self.recipe(name="Aurora", **changes).digest())
+
+    def test_every_style_renders_from_the_command_line(self) -> None:
+        for style in os_builder.WALLPAPER_STYLES:
+            with self.subTest(style=style):
+                path = self.tmp / f"{style}.png"
+                recipe = self.recipe(name="Cli", wallpaper_style=style, wallpaper_size="120x120")
+                saved = self.tmp / "cli.json"
+                recipe.save(saved)
+                with captured():
+                    code = os_builder.main(["--wallpaper", str(saved), "--out", str(path)])
+                self.assertEqual(code, 0)
+                self.assertTrue(path.is_file())
+                self.assertEqual(os_builder.read_png_size(path), (120, 120))
+
+
+class RecipeToolTests(TempDirCase):
+    def test_normalise_tidies_without_changing_the_meaning(self) -> None:
+        messy = self.recipe(
+            name="  Aurora  ",
+            accent="#4F9CF9",
+            hostname="aurora",
+            wallpaper_size="1280X720",
+            packages=["htop", "htop", " vim "],
+            motd="hello",
+        )
+        tidied, changes = os_builder.normalise(messy)
+        joined = "\n".join(changes)
+        self.assertIn("name", joined)
+        self.assertIn("accent", joined)
+        self.assertIn("packages", joined)
+        self.assertIn("motd", joined)
+        self.assertIn("hostname", joined, "a hostname that repeats the derived one is dropped")
+        self.assertEqual(tidied.name, "Aurora")
+        self.assertEqual(tidied.accent, "#4f9cf9")
+        self.assertEqual(tidied.wallpaper_size, "1280x720")
+        self.assertEqual(tidied.packages, ["htop", "vim"])
+        self.assertTrue(tidied.motd.endswith("\n"))
+        self.assertEqual(
+            tidied.resolved_hostname, messy.resolved_hostname, "the machine is still called the same"
+        )
+        self.assertEqual(tidied.hostname, "")
+
+    def test_normalise_has_nothing_to_say_about_a_clean_recipe(self) -> None:
+        clean = self.recipe(name="Aurora", accent="#4f9cf9", motd="hi\n", packages=["htop"])
+        tidied, changes = os_builder.normalise(clean)
+        self.assertEqual(changes, [])
+        self.assertEqual(tidied.as_dict(), clean.as_dict())
+
+    def test_fix_prints_the_changes_and_touches_nothing(self) -> None:
+        path = self.tmp / "messy.json"
+        self.recipe(name="  Aurora  ", accent="#4F9CF9").save(path)
+        before = path.read_bytes()
+        with captured() as box:
+            code = os_builder.main(["--fix", str(path)])
+        self.assertEqual(code, 0)
+        self.assertIn("os-builder: name:", box.stdout)
+        self.assertIn("--out FILE", box.stdout)
+        self.assertEqual(path.read_bytes(), before, "--fix on its own is a look, not a rewrite")
+        printed = box.stdout[box.stdout.index("{") : box.stdout.rindex("}") + 1]
+        self.assertEqual(json.loads(printed)["name"], "Aurora", "what it prints is a recipe, not prose")
+
+    def test_fix_writes_a_canonical_file_when_asked(self) -> None:
+        path = self.tmp / "messy.json"
+        out = self.tmp / "tidy.json"
+        self.recipe(name="  Aurora  ", accent="#4F9CF9", packages=["htop", "htop"]).save(path)
+        with captured():
+            self.assertEqual(os_builder.main(["--fix", str(path), "--out", str(out)]), 0)
+        self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["name"], "Aurora")
+        self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["packages"], ["htop"])
+
+    def test_fix_still_reports_a_recipe_that_cannot_build(self) -> None:
+        path = self.tmp / "bad.json"
+        path.write_text('{"name": "Bad", "accent": "cyan"}', encoding="utf-8")
+        with captured() as box:
+            code = os_builder.main(["--fix", str(path)])
+        self.assertEqual(code, 2)
+        self.assertIn("not buildable", box.text)
+
+    def test_diff_names_both_sides_and_returns_one(self) -> None:
+        left = self.tmp / "left.json"
+        right = self.tmp / "right.json"
+        self.recipe(name="A", preset="desktop").save(left)
+        self.recipe(name="A", preset="minimal", packages=["htop"]).save(right)
+        with captured() as box:
+            self.assertEqual(os_builder.main(["--diff", str(left), str(right)]), 1)
+        self.assertIn("left.json -> right.json", box.stdout)
+        self.assertIn("preset:", box.stdout)
+        self.assertIn("+htop", box.stdout)
+        with captured() as quiet:
+            self.assertEqual(os_builder.main(["--diff", str(left), str(left)]), 0)
+        self.assertIn("the same build", quiet.stdout)
+
+    def test_batch_checks_every_recipe_and_returns_the_worst(self) -> None:
+        folder = self.tmp / "recipes"
+        folder.mkdir()
+        self.recipe(name="Good").save(folder / "good.json")
+        (folder / "bad.json").write_text('{"name": "Bad", "release": "potato"}', encoding="utf-8")
+        with captured() as box:
+            code = os_builder.main(["--batch", str(folder)])
+        self.assertEqual(code, 2)
+        self.assertIn("looks good", box.text)
+        self.assertIn("potato", box.text)
+        self.assertIn("checked 2 recipe(s)", box.text)
+
+    def test_batch_refuses_a_folder_without_recipes(self) -> None:
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        with captured() as box:
+            self.assertEqual(os_builder.main(["--batch", str(empty)]), 2)
+        self.assertIn("no recipes", box.text)
+        with captured() as box:
+            self.assertEqual(os_builder.main(["--batch", str(self.tmp / "nope")]), 2)
+        self.assertIn("not a directory", box.text)
+
+    def test_preset_info_prints_one_preset_in_full(self) -> None:
+        key = sorted(os_builder.PRESETS)[-1]
+        with captured() as box:
+            self.assertEqual(os_builder.main(["--preset-info", key]), 0)
+        self.assertIn(os_builder.PRESETS[key].label, box.stdout)
+        self.assertIn("packages:", box.stdout)
+        with captured() as box:
+            self.assertEqual(os_builder.main(["--preset-info", "kitchen-sink"]), 2)
+        self.assertIn("no preset called", box.text)
+        self.assertIn("desktop", box.text, "the typo message lists what is available")
+
+    def test_explain_covers_every_field_the_gui_edits(self) -> None:
+        with captured() as box:
+            self.assertEqual(os_builder.main(["--explain"]), 0)
+        text = box.stdout
+        for field in os_builder.Recipe.__dataclass_fields__:
+            if field in {"base_dir", "files", "hooks"}:
+                continue
+            self.assertIn(field, text, f"--explain skipped {field}")
+        self.assertIn("--copy", text, "it says what the builder is handed, not just the field name")
+        for name, meaning in os_builder.EXPLANATIONS:
+            with self.subTest(name=name):
+                self.assertLessEqual(
+                    len(name), os_builder.EXPLAIN_NAME_WIDTH, f"{name} would collide with its description"
+                )
+                self.assertTrue(meaning, "an explanation that explains nothing is a bug")
+
+    def test_gui_check_tells_the_truth_about_this_machine(self) -> None:
+        with captured() as box:
+            code = os_builder.gui_check()
+        self.assertIn(code, (0, 1))
+        self.assertIn(os_builder.__version__, box.stdout)
+        if code == 1:
+            self.assertTrue("tkinter" in box.text or "display" in box.text, box.text)
+
+    def test_environment_defaults_fill_only_what_the_recipe_left_blank(self) -> None:
+        os.environ["OS_BUILDER_OUTPUT"] = "/srv/out"
+        os.environ["OS_BUILDER_WORK"] = "/srv/work"
+        os.environ["OS_BUILDER_TIMEOUT"] = "600"
+        self.addCleanup(os.environ.pop, "OS_BUILDER_OUTPUT")
+        self.addCleanup(os.environ.pop, "OS_BUILDER_WORK")
+        self.addCleanup(os.environ.pop, "OS_BUILDER_TIMEOUT")
+        blank = os_builder.Recipe.from_dict({"name": "Env"})
+        filled = os_builder.apply_environment(blank)
+        self.assertEqual(filled.output_dir, "/srv/out")
+        self.assertEqual(filled.work_dir, "/srv/work")
+        self.assertEqual(filled.boot_timeout, 600)
+        chosen = os_builder.Recipe.from_dict({"name": "Env", "output_dir": "/home/me/out"})
+        self.assertEqual(os_builder.apply_environment(chosen).output_dir, "/home/me/out", "the file wins")
+
+    def test_a_silly_timeout_in_the_environment_is_ignored(self) -> None:
+        os.environ["OS_BUILDER_TIMEOUT"] = "5"
+        self.addCleanup(os.environ.pop, "OS_BUILDER_TIMEOUT")
+        self.assertEqual(os_builder.apply_environment(os_builder.Recipe()).boot_timeout, 300)
+        os.environ["OS_BUILDER_TIMEOUT"] = "soon"
+        self.assertEqual(os_builder.apply_environment(os_builder.Recipe()).boot_timeout, 300)
+
+    def test_a_hint_is_offered_for_a_known_failure(self) -> None:
+        self.assertEqual(os_builder.hint_from_log([]), "")
+        self.assertIn(
+            "20 GiB", os_builder.hint_from_log(["dpkg-deb: write failure: No space left on device"])
+        )
+        self.assertIn(
+            "docker group", os_builder.hint_from_log(["ERROR: permission denied while trying to connect"])
+        )
+        self.assertEqual(os_builder.hint_from_log(["everything is fine"]), "")
+
+    def test_a_recipe_file_and_a_loaded_recipe_agree(self) -> None:
+        path = self.tmp / "report.json"
+        recipe = self.recipe(name="Aurora", packages=["htop"])
+        recipe.save(path)
+        report = os_builder.recipe_report(os_builder.Recipe.from_file(path), path)
+        self.assertEqual(report["digest"], recipe.digest())
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["packages"], recipe.merged_packages())
+        self.assertEqual(report["hostname"], recipe.resolved_hostname)
+        self.assertEqual(report["command"], os_builder.recipe_to_argv(recipe))
+
+
+class CommandLineReportTests(TempDirCase):
+    def test_check_as_json_is_one_machine_readable_object(self) -> None:
+        path = self.tmp / "demo.json"
+        self.recipe(name="Demo").save(path)
+        with captured() as box:
+            self.assertEqual(os_builder.main(["--check", str(path), "--json"]), 0)
+        payload = json.loads(box.stdout)
+        self.assertEqual(payload["digest"], os_builder.Recipe.from_file(path).digest())
+        self.assertTrue(payload["ready"])
+
+    def test_check_as_json_carries_the_reasons_too(self) -> None:
+        path = self.tmp / "demo.json"
+        path.write_text('{"name": "Demo", "accent": "cyan"}', encoding="utf-8")
+        with captured() as box:
+            self.assertEqual(os_builder.main(["--check", str(path), "--json"]), 2)
+        payload = json.loads(box.stdout)
+        self.assertFalse(payload["ready"])
+        self.assertEqual(len(payload["problems"]), 1)
+
+    def test_preview_as_json_does_not_run_the_builder(self) -> None:
+        path = self.tmp / "demo.json"
+        self.recipe(name="Demo").save(path)
+        with (
+            captured() as box,
+            unittest.mock.patch.object(
+                os_builder, "BuildRun", side_effect=AssertionError("the builder must not start")
+            ),
+        ):
+            self.assertEqual(os_builder.main(["--preview", str(path), "--json"]), 0)
+        payload = json.loads(box.stdout)
+        self.assertTrue(any(arg == "--dry-run" for arg in payload["command"]), "the plan says what would run")
+
+    def test_build_as_json_ends_with_the_summary(self) -> None:
+        path = self.tmp / "demo.json"
+        self.recipe(name="Demo").save(path)
+
+        class Stub:
+            def __init__(self, argv: list[str], *, cwd: Path | None = None) -> None:
+                self.argv, self.started_at = list(argv), 0.0
+                self.progress = os_builder.Progress(done=True, ok=True)
+                self.running = False
+                self.log: list[str] = []
+                self.finish_code: int | None = 0
+                self.stdout_lines: list[str] = []
+
+            def start(self) -> None:
+                self.stdout_lines = ["live-build: done"]
+
+            def drain(self, limit: int = 400) -> list[str]:
+                lines, self.stdout_lines = self.stdout_lines, []
+                return lines
+
+            def stop(self) -> None:
+                pass
+
+        with captured() as box, unittest.mock.patch.object(os_builder, "BuildRun", Stub):
+            self.assertEqual(os_builder.main(["--build", str(path), "--json", "--quiet"]), 0)
+        payload = json.loads(box.stdout[box.stdout.index("{") : box.stdout.rindex("}") + 1])
+        self.assertEqual(payload["status"], 0)
+        self.assertEqual(payload["digest"], os_builder.Recipe.from_file(path).digest())
+        self.assertEqual(payload["artifacts"], [], "the stub produced no files")
+
+    def test_quiet_build_shows_the_tail_when_the_builder_fails(self) -> None:
+        path = self.tmp / "demo.json"
+        self.recipe(name="Demo").save(path)
+
+        class Stub:
+            """A BuildRun whose child is already dead, with two lines left in the pipe."""
+
+            def __init__(self, argv: list[str], *, cwd: Path | None = None) -> None:
+                self.argv, self.started_at = list(argv), 0.0
+                self.progress = os_builder.Progress(done=True, ok=False)
+                self.running = False
+                self.log: list[str] = []
+                self.pending = ["dpkg: no space left on device", "build failed"]
+                self.finish_code: int | None = 11
+
+            def start(self) -> None:
+                pass
+
+            def drain(self, limit: int = 400) -> list[str]:
+                # exactly what BuildRun does: the lines leave the pipe and join the log
+                lines, self.pending = self.pending[:limit], self.pending[limit:]
+                self.log.extend(lines)
+                return lines
+
+            def stop(self) -> None:
+                pass
+
+        with captured() as box, unittest.mock.patch.object(os_builder, "BuildRun", Stub):
+            code = os_builder.main(["--build", str(path), "--quiet", "--tail", "2"])
+        self.assertEqual(code, 11)
+        self.assertIn("dpkg: no space left on device", box.stdout, "--tail must repeat what was swallowed")
+        self.assertIn("build failed", box.stdout)
+        self.assertIn("20 GiB", box.text, "and pair it with the hint")
+        with captured() as silent, unittest.mock.patch.object(os_builder, "BuildRun", Stub):
+            self.assertEqual(os_builder.main(["--build", str(path), "--quiet"]), 11)
+        self.assertNotIn("dpkg:", silent.stdout, "without --tail the swallowed log stays swallowed")
+
+
+class GuiSystemTabTests(TempDirCase):
+    """The controls that only exist in the GUI: the seed roller, the tab jumper, examples."""
+
+    @contextlib.contextmanager
+    def design(self, **fields: object) -> Iterator[tuple[object, dict[str, object]]]:
+        with fake_tkinter() as env:
+            gui = env["gui"].BuilderGUI(model=self.model(**fields))
+            try:
+                yield gui, env
+            finally:
+                gui._on_close()
+
+    def test_rolling_the_seed_reaches_the_model_and_the_entry(self) -> None:
+        with self.design(name="Gui OS") as (gui, env):
+            before = gui.model.recipe.wallpaper_seed
+            with unittest.mock.patch.object(env["gui"].random, "randrange", return_value=4242):
+                gui._roll_seed()
+            self.assertEqual(gui.model.recipe.wallpaper_seed, 4242)
+            self.assertNotEqual(gui.model.recipe.wallpaper_seed, before)
+            self.assertEqual(int(gui.vars["wallpaper_seed"].get()), 4242, "the widget follows the model")
+
+    def test_the_kernel_menu_offers_the_kernels_the_builder_knows(self) -> None:
+        with self.design(name="Gui OS"):
+            offered = {tuple(w.created_with.get("values") or ()) for w in CREATED}
+            self.assertIn(
+                tuple(os_builder.KERNELS), offered, "the kernel row must offer what the builder accepts"
+            )
+
+    def test_every_tab_has_a_key_and_the_keys_jump_in_order(self) -> None:
+        with self.design(name="Gui OS") as (gui, _env):
+            bound = dict(gui.root.bindings)
+            for index in range(len(os_builder.TAB_NAMES)):
+                self.assertIn(
+                    f"Alt-{index + 1}", bound, "a tab without a keystroke is a tab you must hunt for"
+                )
+            self.assertIn("Control-e", bound, "the build command deserves a key of its own")
+            self.assertIn("F1", bound)
+            gui.notebook.calls.clear()
+            bound["Alt-4"](None)
+            self.assertIn(("select", (3,), {}), gui.notebook.calls, "Alt-4 must land on the fourth tab")
+
+            # a tab index Tk would reject must not travel any further than this handler
+            def explode(_index: int) -> None:
+                raise ValueError("bad window system event")
+
+            gui.notebook.select = explode
+            bound["Alt-6"](None)
+
+    def test_the_examples_menu_opens_a_recipe_and_reports_a_broken_one(self) -> None:
+        good = self.tmp / "aurora.json"
+        self.recipe(name="From Example", preset="desktop").save(good)
+        bad = self.tmp / "broken.json"
+        bad.write_text("{not json", encoding="utf-8")
+        with self.design(name="Gui OS") as (gui, env):
+            gui._example_loader(good)()
+            self.assertEqual(gui.model.recipe.name, "From Example")
+            gui._example_loader(bad)()
+            self.assertEqual(gui.model.recipe.name, "From Example", "a broken example must not half-load")
+            self.assertTrue(any(kind == "error" for kind, _t, _m in env["messagebox"].calls))
+
+    def test_the_menu_lists_the_recipes_next_to_the_script(self) -> None:
+        found = os_builder.example_recipes()
+        self.assertTrue(found, "the repository ships examples; the GUI menu depends on that")
+        for path in found:
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.suffix, ".json")
+        self.assertEqual(found, sorted(found), "the menu order is the file order, so it is stable")
+
+
+class StyleSheetTests(TempDirCase):
+    """tools/style_sheet.py draws the README image; a test makes sure it still can."""
+
+    @staticmethod
+    def load_tool():
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "style_sheet", Path(os_builder.__file__).resolve().parent / "tools" / "style_sheet.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_tile_argument_is_its_own_small_thing(self) -> None:
+        tool = self.load_tool()
+        self.assertEqual(tool.parse_tile("240x135"), (240, 135))
+        for wrong in ("8x8", "wide", "1024x1025", ""):
+            with self.subTest(tile=wrong), self.assertRaises(SystemExit) as caught:
+                tool.parse_tile(wrong)
+            self.assertIn("--tile", str(caught.exception))
+
+    def test_it_renders_a_sheet_of_every_style(self) -> None:
+        out = self.tmp / "sheet.png"
+        with captured():
+            code = self.load_tool().main(
+                ["--out", str(out), "--tile", "48x24", "--columns", "3", "--gap", "2"]
+            )
+        self.assertEqual(code, 0)
+        columns = 3
+        rows = -(-len(os_builder.WALLPAPER_STYLES) // columns)
+        self.assertEqual(
+            os_builder.read_png_size(out),
+            (columns * 48 + (columns + 1) * 2, rows * 24 + (rows + 1) * 2),
+            "the sheet must be every style, tiled, with its gaps",
+        )
+
+    def test_the_rehearsed_command_line_works_as_a_process(self) -> None:
+        # CI calls it as a script; that is the path a README reader follows too
+        script = Path(os_builder.__file__).resolve().parent / "tools" / "style_sheet.py"
+        out = self.tmp / "via-subprocess.png"
+        completed = subprocess.run(
+            [sys.executable, str(script), "--out", str(out), "--tile", "32x32", "--columns", "4"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("wrote", completed.stdout)
+        self.assertTrue(out.is_file())
+
+    def test_a_bad_accent_is_refused_before_any_drawing(self) -> None:
+        with captured() as box, self.assertRaises(SystemExit) as caught:
+            self.load_tool().main(["--out", str(self.tmp / "x.png"), "--accent", "sky-blue"])
+        self.assertIn("--accent", str(caught.exception))
+        self.assertNotIn("wrote", box.stdout)
+
+    def test_the_checked_in_sheet_is_small_enough_to_ship(self) -> None:
+        """A README image is a promise to the reader on a bad connection."""
+        sheet = Path(os_builder.__file__).resolve().parent / "docs" / "wallpaper-styles.png"
+        self.assertTrue(sheet.is_file(), "README.md links this image, so it has to exist")
+        self.assertLess(sheet.stat().st_size, 320_000, "regenerate it with tools/style_sheet.py")
+        width, height = os_builder.read_png_size(sheet)
+        self.assertGreater(width, height, "eleven styles tile wider than they are tall")
 
 
 if __name__ == "__main__":

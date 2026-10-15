@@ -31,9 +31,11 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import platform
 import queue
+import random
 import re
 import shlex
 import shutil
@@ -44,7 +46,8 @@ import tempfile
 import threading
 import time
 import zlib
-from collections.abc import Callable, Iterable, Sequence
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -59,9 +62,50 @@ ARCHITECTURES = ("amd64", "arm64")
 COMPRESSIONS = ("zstd", "xz", "gzip", "lz4", "none")
 CONTAINERS = ("auto", "always", "never")
 ACCENTS = ("#4f9cf9", "#39d353", "#f78166", "#bc8cff", "#f2cc60", "#ff6ac1", "#79c0ff")
-WALLPAPER_STYLES = ("gradient", "sunset", "rays", "grid", "waves")
+# The GUI's tab order, in one place so the view and the tests cannot disagree.
+TAB_NAMES = ("identity", "software", "system", "appearance", "files & hooks", "build")
+
+WALLPAPER_STYLES = (
+    "gradient",
+    "sunset",
+    "rays",
+    "grid",
+    "waves",
+    "aurora",
+    "mesh",
+    "dots",
+    "stripes",
+    "spiral",
+    "nebula",
+)
+# What a desktop calls "how the picture fills the screen"; the names are GNOME's.
+PICTURE_OPTIONS = ("zoomed", "wallpaper", "scaled", "stretched", "centered", "spanned")
+# XFCE's numeric equivalent of the same choice, for the XML profile the hook writes.
+XFCE_IMAGE_STYLE = {"zoomed": 5, "wallpaper": 0, "scaled": 1, "stretched": 2, "centered": 4, "spanned": 3}
+KERNELS = ("auto", "generic", "cloud", "realtime", "none")
+KERNEL_PACKAGES = {
+    "amd64": {
+        "generic": "linux-image-amd64",
+        "cloud": "linux-image-cloud-amd64",
+        "realtime": "linux-image-rt-amd64",
+    },
+    "arm64": {
+        "generic": "linux-image-arm64",
+        "cloud": "linux-image-cloud-arm64",
+        "realtime": "linux-image-rt-arm64",
+    },
+}
+DEFAULT_HOME_URL = "https://github.com/codero-sus/OS-Maker"
 HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+PACKAGE_RE = re.compile(r"[A-Za-z0-9+._~-]+(?::[A-Za-z0-9+._~-]+)?")
+LOCALE_RE = re.compile(r"^[a-z]{2}(?:_[A-Z]{2})?(?:\.[A-Za-z0-9-]{1,14})?(?:@[A-Za-z]{1,8})?$")
+KEYMAP_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
+TIMEZONE_RE = re.compile(r"^[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]{1,32}){1,2}$")
+URL_RE = re.compile("^https?://[^\\s'\"<>`]+$", re.IGNORECASE)
+VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,31}$")
+SOURCE_LINE_RE = re.compile(r"^(?:deb|deb-src) (?:\[[^\]]*\] )?https?://\S+ \S+(?: \S+)+$")
+ONE_LINE_MAX = 80
 SIZE_RE = re.compile(r"^(\d{2,5})\s*[xX*]\s*(\d{2,5})$")
 
 
@@ -142,6 +186,61 @@ PRESETS: dict[str, Preset] = {
             wallpaper="rays",
         ),
         Preset(
+            "media",
+            "Living-room media box",
+            "Boots on the television: Kodi, mpv, VLC and the codecs, on a desktop a remote drives.",
+            ("task-xfce-desktop", "kodi", "mpv", "vlc", "ffmpeg", "fonts-dejavu"),
+            desktop="task-xfce-desktop",
+            firmware=True,
+            accent="#f78166",
+            wallpaper="nebula",
+        ),
+        Preset(
+            "creative",
+            "Studio workstation",
+            "Images, vector, 3D, audio and video editing, with the fonts and codecs that go with them.",
+            (
+                "task-gnome-desktop",
+                "gimp",
+                "inkscape",
+                "blender",
+                "audacity",
+                "kdenlive",
+                "fonts-firacode",
+            ),
+            desktop="task-gnome-desktop",
+            accent="#ff6ac1",
+            wallpaper="mesh",
+        ),
+        Preset(
+            "office",
+            "Everyday office",
+            "LibreOffice, a browser, email and an ebook reader: a whole desk in one ISO.",
+            ("task-mate-desktop", "libreoffice", "firefox-esr", "thunderbird", "calibre"),
+            desktop="task-mate-desktop",
+            accent="#f2cc60",
+            wallpaper="dots",
+        ),
+        Preset(
+            "network",
+            "Network workshop",
+            "Packet capture, auditing and wireless tools for a machine you boot to look at a network.",
+            ("task-x11", "xterm", "nmap", "tcpdump", "tshark", "whois", "bind9-dnsutils"),
+            desktop="task-x11",
+            firmware=True,
+            accent="#79c0ff",
+            wallpaper="grid",
+        ),
+        Preset(
+            "classroom",
+            "Classroom lab",
+            "A desktop with the learning stack: typing, sky, drawing and an office suite.",
+            ("task-gnome-desktop", "libreoffice", "gcompris-qt", "stellarium", "tuxtype", "tuxmath"),
+            desktop="task-gnome-desktop",
+            accent="#39d353",
+            wallpaper="aurora",
+        ),
+        Preset(
             "kiosk",
             "Single-page kiosk",
             "Boots straight into a fullscreen browser: displays, demos and reception desks.",
@@ -186,6 +285,25 @@ class Recipe:
     work_dir: str = ""
     cache_dir: str = ""
     notes: str = ""
+    # identity, advertised the way the distribution does it
+    version: str = ""  # empty means "1.0", which is what os-release gets
+    author: str = ""
+    home_url: str = ""
+    # how the machine behaves once it is installed or booted
+    locale: str = ""
+    keyboard: str = ""
+    timezone: str = ""
+    kernel: str = "auto"
+    grub_timeout: int = 5
+    # extra software decisions the builder can express but Debian's CLI cannot
+    apt_sources: list[str] = field(default_factory=list)
+    remove_packages: list[str] = field(default_factory=list)
+    # appearance details that reach the desktop, not just the picture
+    picture_options: str = "zoomed"
+    show_wordmark: bool = True
+    motd_art: bool = False
+    wallpaper_seed: int = 0
+    with_branding_record: bool = True
 
     def __post_init__(self) -> None:
         # Not a field: relative paths in a recipe resolve against the folder the recipe
@@ -205,7 +323,7 @@ class Recipe:
         if unknown:
             raise RecipeError(f"unknown recipe key(s): {', '.join(unknown)}")
         recipe = cls(**{key: value for key, value in data.items() if key in fields})
-        for name in ("packages", "files", "hooks"):
+        for name in ("packages", "files", "hooks", "apt_sources", "remove_packages"):
             entries = getattr(recipe, name)
             if not isinstance(entries, list) or any(not isinstance(item, str) for item in entries):
                 raise RecipeError(f"'{name}' must be a list of strings")
@@ -226,16 +344,39 @@ class Recipe:
             "work_dir",
             "cache_dir",
             "notes",
+            "version",
+            "author",
+            "home_url",
+            "locale",
+            "keyboard",
+            "timezone",
+            "kernel",
+            "picture_options",
         ):
             if not isinstance(getattr(recipe, name), str):
                 raise RecipeError(f"'{name}' must be a string")
-        for name in ("with_firmware", "with_wallpaper", "boot_test", "keep_work", "skip_checks"):
+        for name in (
+            "with_firmware",
+            "with_wallpaper",
+            "boot_test",
+            "keep_work",
+            "skip_checks",
+            "show_wordmark",
+            "motd_art",
+            "with_branding_record",
+        ):
             if not isinstance(getattr(recipe, name), bool):
                 raise RecipeError(f"'{name}' must be true or false")
-        # bool is an int in Python, so it has to be ruled out before the int check or
-        # "boot_timeout": true would load as 1 second and waste someone's afternoon
-        if isinstance(recipe.boot_timeout, bool) or not isinstance(recipe.boot_timeout, int):
-            raise RecipeError("'boot_timeout' must be a whole number of seconds")
+        # bool is an int in Python, so it has to be ruled out first or "boot_timeout":
+        # true would load as 1 second and waste someone's afternoon
+        for name, shape in (
+            ("boot_timeout", "a whole number of seconds"),
+            ("grub_timeout", "a whole number of seconds"),
+            ("wallpaper_seed", "a whole number"),
+        ):
+            value = getattr(recipe, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise RecipeError(f"'{name}' must be {shape}")
         return recipe
 
     @classmethod
@@ -296,7 +437,49 @@ class Recipe:
 
     @property
     def display_motd(self) -> str:
-        return self.motd or default_motd(self.name, self.tagline)
+        body = self.motd or default_motd(self.name, self.tagline)
+        if not self.motd_art:
+            return body
+        banner = wordmark_art(self.name.strip(), limit=12)
+        return f"{banner}\n{body}" if banner else body
+
+    @property
+    def pretty_name(self) -> str:
+        """What os-release shows: the name, plus the recipe's version when it has one."""
+        name = self.name.strip()
+        return f"{name} {self.version}" if self.version.strip() else name
+
+    @property
+    def kernel_package(self) -> str:
+        """The kernel this recipe asks for, or "" to let Debian's default stand."""
+        if self.kernel not in KERNELS or self.kernel in ("auto", "none"):
+            return ""
+        return KERNEL_PACKAGES.get(self.architecture, {}).get(self.kernel, "")
+
+    def digest(self) -> str:
+        """A stable hash of these settings: same recipe, same digest, any machine."""
+        return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()
+
+    @property
+    def branding_record(self) -> str:
+        """The machine-readable card the image carries, so a guest can say who built it."""
+        record = {
+            "name": self.name.strip(),
+            "version": self.version.strip() or "1.0",
+            "tagline": self.tagline.strip(),
+            "hostname": self.resolved_hostname,
+            "preset": self.preset,
+            "release": self.release,
+            "architecture": self.architecture,
+            "accent": self.accent,
+            "wallpaper_style": self.wallpaper_style,
+            "wallpaper_size": self.wallpaper_size,
+            "locale": self.locale,
+            "timezone": self.timezone,
+            "recipe_digest": self.digest(),
+            "builder": f"os_builder.py {__version__}",
+        }
+        return json.dumps(record, indent=2, ensure_ascii=False) + "\n"
 
     @property
     def resolved_output_dir(self) -> Path:
@@ -308,9 +491,13 @@ class Recipe:
         return preset.packages if preset else ()
 
     def merged_packages(self) -> list[str]:
-        """The preset's packages plus the user's own, de-duplicated, order preserved."""
+        """The preset's packages, the kernel the recipe asks for and the user's own.
+
+        De-duplicated, order preserved: a list you can read back off the command line.
+        """
+        wanted = (self.kernel_package, *self.preset_packages, *self.packages)
         seen: dict[str, None] = {}
-        for package in [*self.preset_packages, *self.packages]:
+        for package in wanted:
             name = package.strip()
             if name:
                 seen.setdefault(name, None)
@@ -341,16 +528,59 @@ class Recipe:
                 f"wallpaper style {self.wallpaper_style!r} must be one of {', '.join(WALLPAPER_STYLES)}"
             )
         if parse_size(self.wallpaper_size) is None:
-            problems.append(f"wallpaper size {self.wallpaper_size!r} must look like 1920x1080")
+            # two different mistakes deserve two different sentences: a shape that is
+            # not a size at all, and a size the renderer will not draw
+            if SIZE_RE.match(self.wallpaper_size.strip()):
+                problems.append(f"wallpaper size {self.wallpaper_size!r} must be between 64x64 and 4096x4096")
+            else:
+                problems.append(f"wallpaper size {self.wallpaper_size!r} must look like 1920x1080")
         if not HEX_COLOR_RE.match(self.accent):
             problems.append(f"accent colour {self.accent!r} must look like #4f9cf9")
         if not isinstance(self.boot_timeout, int) or not 30 <= self.boot_timeout <= 7200:
             problems.append("boot timeout must be a whole number of seconds between 30 and 7200")
+        if self.version and not VERSION_RE.match(self.version.strip()):
+            problems.append(f"version {self.version!r} must be short and shell-safe, like 2.1 or 1.0-rc1")
+        if self.author.strip() and (
+            len(self.author.strip()) > ONE_LINE_MAX or any(char in self.author for char in "\r\n\0")
+        ):
+            problems.append(f"the author line has to fit on one line, {ONE_LINE_MAX} characters or fewer")
+        if self.home_url.strip() and not URL_RE.match(self.home_url.strip()):
+            problems.append(f"home URL {self.home_url!r} must be a full http(s) URL with no spaces")
+        if self.kernel not in KERNELS:
+            problems.append(f"kernel {self.kernel!r} must be one of {', '.join(KERNELS)}")
+        if self.kernel not in KERNELS or (self.kernel != "auto" and not self.kernel_package):
+            problems.append(
+                f"no {self.kernel} kernel is published for {self.architecture}; use 'auto' to let Debian choose"
+            )
+        if self.picture_options not in PICTURE_OPTIONS:
+            problems.append(
+                f"background fit {self.picture_options!r} must be one of {', '.join(PICTURE_OPTIONS)}"
+            )
+        if not isinstance(self.grub_timeout, int) or not 0 <= self.grub_timeout <= 120:
+            problems.append("boot menu timeout must be a whole number of seconds between 0 and 120")
+        if not isinstance(self.wallpaper_seed, int):
+            problems.append("the wallpaper seed must be a whole number")
+        for field_name, pattern, shape in (
+            ("locale", LOCALE_RE, "like en_GB.UTF-8"),
+            ("keyboard", KEYMAP_RE, "a console keymap, like gb or de"),
+            ("timezone", TIMEZONE_RE, "like Europe/London"),
+        ):
+            value = getattr(self, field_name).strip()
+            if value and not pattern.match(value):
+                problems.append(f"{field_name} {value!r} must be {shape}")
+        for line in self.apt_sources:
+            if not SOURCE_LINE_RE.match(line.strip()):
+                problems.append(
+                    f"apt source {line.strip()!r} must be one 'deb https://host suite component' line"
+                )
+        for package in self.remove_packages:
+            if not PACKAGE_RE.fullmatch(package.strip() or "\0"):
+                problems.append(f"{package!r} is not a valid Debian package name")
         hostname = self.resolved_hostname
         if not HOSTNAME_RE.match(hostname):
             problems.append(f"hostname {hostname!r} must be 1-63 letters, digits and dashes")
         for package in self.merged_packages():
-            if not re.fullmatch(r"[A-Za-z0-9+._~-]+(:[A-Za-z0-9+._~-]+)?", package):
+            if not PACKAGE_RE.fullmatch(package):
                 problems.append(f"{package!r} is not a valid Debian package name")
         for entry in self.files:
             source, separator, destination = entry.rpartition(":")
@@ -683,6 +913,23 @@ def _ramp(distance: int, span: int) -> float:
     return max(0.0, min(1.0, min(distance, span - distance) / edge))
 
 
+def wordmark_art(text: str, *, limit: int = 12) -> str:
+    """The recipe's name as block ASCII, for a message of the day.
+
+    Uses the wallpaper's own 5x7 face, so the login banner and the desktop agree.
+    Anything longer than ``limit`` characters is left out rather than wrapped: a
+    broken banner across an 80-column terminal is worse than none.
+    """
+    name = text.strip()
+    if not name or len(name) > limit:
+        return ""
+    mask = text_mask(name)
+    if not mask:
+        return ""
+    rows = ["".join("##" if pixel == "#" else "  " for pixel in line) for line in mask]
+    return "\n".join(row.rstrip() for row in rows).rstrip("\n")
+
+
 def wallpaper_pixels(recipe: Recipe, width: int, height: int) -> list[list[tuple[int, int, int]]]:
     """The generated wallpaper: rows of ``(r, g, b)``.
 
@@ -693,6 +940,7 @@ def wallpaper_pixels(recipe: Recipe, width: int, height: int) -> list[list[tuple
     width, height = max(2, width), max(2, height)
     red, green, blue = hex_to_rgb(recipe.accent)
     style = recipe.wallpaper_style
+    seed = recipe.wallpaper_seed
     if style == "sunset":
         sky = _sunset_rows(width, height, red, green, blue)
     elif style == "rays":
@@ -701,9 +949,21 @@ def wallpaper_pixels(recipe: Recipe, width: int, height: int) -> list[list[tuple
         sky = _grid_rows(width, height, red, green, blue)
     elif style == "waves":
         sky = _waves_rows(width, height, red, green, blue)
+    elif style == "aurora":
+        sky = _aurora_rows(width, height, red, green, blue, seed)
+    elif style == "mesh":
+        sky = _mesh_rows(width, height, red, green, blue, seed)
+    elif style == "dots":
+        sky = _dots_rows(width, height, red, green, blue, seed)
+    elif style == "stripes":
+        sky = _stripes_rows(width, height, red, green, blue, seed)
+    elif style == "spiral":
+        sky = _spiral_rows(width, height, red, green, blue, seed)
+    elif style == "nebula":
+        sky = _nebula_rows(width, height, red, green, blue, seed)
     else:
         sky = _gradient_rows(width, height, red, green, blue)
-    if recipe.with_wallpaper:
+    if recipe.with_wallpaper and recipe.show_wordmark:
         title = recipe.name.strip()
         if title:
             paint_text(
@@ -725,6 +985,172 @@ def wallpaper_pixels(recipe: Recipe, width: int, height: int) -> list[list[tuple
                 scrim=0.34,
             )
     return sky
+
+
+def _lattice(rows: int, columns: int, seed: int) -> list[list[float]]:
+    """A grid of seeded randoms, sampled bilinearly for the organic styles.
+
+    Seeded rather than random, so a recipe renders the same wallpaper on any machine and
+    a screenshot in the README stays true.
+    """
+    rng = random.Random(seed or 7)
+    return [[rng.random() for _ in range(columns + 1)] for _ in range(rows + 1)]
+
+
+def _sample(lattice: list[list[float]], u: float, v: float) -> float:
+    """Bilinear lookup at fractional lattice coordinates, clamped at the edges."""
+    rows = len(lattice) - 1
+    x = min(max(u, 0.0), len(lattice[0]) - 1.001)
+    y = min(max(v, 0.0), rows - 1.001)
+    x0, y0 = int(x), int(y)
+    fx, fy = x - x0, y - y0
+    top = lattice[y0][x0] * (1.0 - fx) + lattice[y0][x0 + 1] * fx
+    below = lattice[y0 + 1][x0] * (1.0 - fx) + lattice[y0 + 1][x0 + 1] * fx
+    return top * (1.0 - fy) + below * fy
+
+
+def _tinted(light: float, red: int, green: int, blue: int) -> tuple[int, int, int]:
+    """Brightness in 0..1, colour out in 0..255, in the accent.
+
+    The floor is a dark blue rather than black: a wallpaper that goes fully black loses
+    the wordmark's scrim and looks like a failed render on a laptop at night.
+    """
+    value = min(1.0, max(0.0, light))
+    return (
+        clamp8(int(8 + (red - 8) * value)),
+        clamp8(int(10 + (green - 10) * value)),
+        clamp8(int(18 + (blue - 18) * value)),
+    )
+
+
+def _aurora_rows(
+    width: int, height: int, red: int, green: int, blue: int, seed: int
+) -> list[list[tuple[int, int, int]]]:
+    """Curtains of light leaning across a night sky."""
+    drift = _lattice(6, 24, seed)
+    brightness = _lattice(4, 8, seed + 11)
+    rows = []
+    for y in range(height):
+        v = y / max(1, height - 1)
+        lean = _sample(drift, v * 5.0, 0.5) - 0.5
+        glow = 0.35 + 0.65 * _sample(brightness, v * 3.0, 0.5)
+        line = []
+        for x in range(width):
+            shifted = x / max(1, width - 1) + lean * (1.0 + v)
+            wave = math.sin(shifted * 6.0 + v * 2.0) + 0.5 * math.sin(shifted * 13.0 - v)
+            curtain = max(0.0, 1.0 - abs((shifted + wave * 0.08) % 0.34 - 0.17) * 7.0) ** 2
+            light = 0.06 + 0.22 * v + curtain * glow * 0.8
+            line.append(_tinted(light, red, green, blue))
+        rows.append(line)
+    return rows
+
+
+def _mesh_rows(
+    width: int, height: int, red: int, green: int, blue: int, seed: int
+) -> list[list[tuple[int, int, int]]]:
+    """Four corner colours, eased into each other: the cheapest thing that looks designed."""
+    rng = random.Random(seed or 3)
+
+    def corner(scale: float, lift: int) -> tuple[int, int, int]:
+        return (
+            clamp8(int(red * scale) + lift + int(10 * rng.random())),
+            clamp8(int(green * scale) + lift),
+            clamp8(int(blue * scale) + lift + int(6 * rng.random())),
+        )
+
+    # deliberately wide: four corners that nearly agree render as flat filler
+    corners = (corner(0.14, 26), corner(1.0, 6), corner(0.34, 10), corner(0.82, 0))
+    rows = []
+    for y in range(height):
+        v = y / max(1, height - 1)
+        left = _blend(corners[0], corners[2], v)
+        right = _blend(corners[1], corners[3], v)
+        line = []
+        for x in range(width):
+            u = x / max(1, width - 1)
+            # eased across, so the middle of the blend has no visible seam
+            line.append(_blend(left, right, 0.5 - 0.5 * math.cos(math.pi * u)))
+        rows.append(line)
+    return rows
+
+
+def _dots_rows(
+    width: int, height: int, red: int, green: int, blue: int, seed: int
+) -> list[list[tuple[int, int, int]]]:
+    """A halftone: dots that swell as they run toward the lower right."""
+    step = max(6, width // 48)
+    jitter = 1.0 + (seed % 7) * 0.11
+    rows = []
+    for y in range(height):
+        v = y / max(1, height - 1)
+        line = []
+        for x in range(width):
+            u = x / max(1, width - 1)
+            gx = (x + jitter * step) % step - step / 2.0
+            gy = (y + jitter * step) % step - step / 2.0
+            radius = step * (0.1 + 0.42 * ((u + v) / 2.0))
+            near = max(0.0, 1.0 - math.hypot(gx, gy) / max(1.0, radius))
+            line.append(_tinted(0.05 + near * near * 0.72, red, green, blue))
+        rows.append(line)
+    return rows
+
+
+def _stripes_rows(
+    width: int, height: int, red: int, green: int, blue: int, seed: int
+) -> list[list[tuple[int, int, int]]]:
+    """Diagonal bands: one accent tone, one deep tone, soft edges."""
+    band = max(10, width // (6 + seed % 10))
+    rows = []
+    for y in range(height):
+        fade = 0.45 + 0.55 * (1.0 - y / max(1, height - 1))
+        line = []
+        for x in range(width):
+            phase = ((x + y * 2) % (band * 2)) / float(band)
+            stripe = 1.0 if phase < 1.0 else max(0.0, 1.0 - (phase - 1.0) * 2.0)
+            line.append(_tinted(0.05 + stripe * fade * 0.8, red, green, blue))
+        rows.append(line)
+    return rows
+
+
+def _spiral_rows(
+    width: int, height: int, red: int, green: int, blue: int, seed: int
+) -> list[list[tuple[int, int, int]]]:
+    """Rays, wound around a point: the same idea as ``rays`` with somewhere to go."""
+    arms = 2 + seed % 4
+    centre_x, centre_y = width * 0.5, height * 0.58
+    rows = []
+    for y in range(height):
+        dy = (y - centre_y) / max(1.0, height * 0.5)
+        line = []
+        for x in range(width):
+            dx = (x - centre_x) / max(1.0, width * 0.5)
+            radius = min(1.6, math.hypot(dx, dy))
+            twist = math.atan2(dy, dx) * arms + radius * 5.0
+            band = 0.5 + 0.5 * math.cos(twist)
+            line.append(_tinted(band**1.6 * (1.0 - 0.5 * radius) + 0.04, red, green, blue))
+        rows.append(line)
+    return rows
+
+
+def _nebula_rows(
+    width: int, height: int, red: int, green: int, blue: int, seed: int
+) -> list[list[tuple[int, int, int]]]:
+    """Two octaves of seeded value noise, plus a scatter of stars."""
+    fine = _lattice(14, 26, seed)
+    coarse = _lattice(5, 9, seed + 3)
+    rows = []
+    for y in range(height):
+        v = y / max(1, height - 1)
+        line = []
+        for x in range(width):
+            u = x / max(1, width - 1)
+            cloud = 0.6 * _sample(coarse, u * 5.0, v * 3.0) + 0.4 * _sample(fine, u * 13.0, v * 7.0)
+            # pushed through a power curve, or the whole thing reads as milk rather than gas
+            cloud = max(0.0, min(1.0, cloud * 1.45 - 0.22)) ** 1.4
+            sparkle = 0.4 if ((x * 73856093) ^ (y * 19349663) ^ (seed * 83492791)) % 98765 == 0 else 0.0
+            line.append(_tinted(0.03 + cloud * 0.9 + sparkle, red, green, blue))
+        rows.append(line)
+    return rows
 
 
 def fit_scale(text: str, width: int, *, cap: int) -> int:
@@ -932,21 +1358,23 @@ def render_wallpaper_png(
 
 def os_release_text(recipe: Recipe) -> str:
     """Branding a live system shows in ``/etc/os-release``."""
-    url = "https://github.com/codero-sus/OS-Maker"
+    url = recipe.home_url.strip() or DEFAULT_HOME_URL
     tagline = recipe.tagline.strip() or "Built with OS Maker"
     values = {
-        "PRETTY_NAME": recipe.name.strip(),
+        "PRETTY_NAME": recipe.pretty_name,
         "NAME": recipe.name.strip(),
         "VERSION": f"{recipe.release} ({tagline})",
-        "VERSION_ID": "1.0",
+        "VERSION_ID": recipe.version.strip() or "1.0",
         "ID": re.sub(r"[^a-z0-9]", "", recipe.resolved_hostname.lower()) or "osmaker",
         "ID_LIKE": "debian",
         "HOME_URL": url,
-        "SUPPORT_URL": f"{url}/issues",
-        "BUG_REPORT_URL": f"{url}/issues",
+        "SUPPORT_URL": url,
+        "BUG_REPORT_URL": f"{url}/issues" if url == DEFAULT_HOME_URL else url,
         "OS_MAKER_PRESET": recipe.preset,
         "OS_MAKER_ACCENT": recipe.accent,
     }
+    if recipe.author.strip():
+        values["OS_MAKER_MAINTAINER"] = recipe.author.strip()
     lines = []
     for key, value in values.items():
         # Debian's own convention: identifiers bare, everything else quoted.
@@ -991,7 +1419,7 @@ def branding_hook_text(recipe: Recipe) -> str:
             "        cat > /etc/dconf/db/local.d/00-os-maker <<'DCONF'",
             "[org/gnome/desktop/background]",
             "picture-uri='file:///usr/share/backgrounds/os-maker.png'",
-            "picture-options='zoomed'",
+            f"picture-options='{recipe.picture_options}'",
             f"primary-color='{recipe.accent}'",
             "color-shading-type='solid'",
             "DCONF",
@@ -1014,7 +1442,7 @@ def branding_hook_text(recipe: Recipe) -> str:
             '      <property name="monitor0" type="empty">',
             '        <property name="workspace0" type="empty">',
             '          <property name="last-image" type="string" value="/usr/share/backgrounds/os-maker.png"/>',
-            '          <property name="image-style" type="int" value="5"/>',
+            f'          <property name="image-style" type="int" value="{XFCE_IMAGE_STYLE.get(recipe.picture_options, 5)}"/>',
             "        </property>",
             "      </property>",
             "    </property>",
@@ -1025,8 +1453,90 @@ def branding_hook_text(recipe: Recipe) -> str:
             "fi",
             "",
         ]
+    lines += _system_setup_lines(recipe)
     lines.append('echo "os-builder: branding installed"')
     return "\n".join(lines) + "\n"
+
+
+def _system_setup_lines(recipe: Recipe) -> list[str]:
+    """The machine-level settings the branding hook applies, one guarded block each.
+
+    Every block tests for the directory or command it needs, because the same hook runs
+    on a 200 MB rescue stick and on a full desktop: an unguarded ``locale-gen`` would
+    fail the build for want of a package the image never promised.
+    """
+    lines: list[str] = []
+    if recipe.timezone:
+        zone = recipe.timezone.strip()
+        lines += [
+            "if [ -f /usr/share/zoneinfo/" + zone + " ]; then",
+            "    ln -sf /usr/share/zoneinfo/" + zone + " /etc/localtime",
+            # the timezone validator already restricts this to path characters
+            f"    printf '%s\n' {zone} > /etc/timezone",
+            "fi",
+            "",
+        ]
+    if recipe.locale:
+        locale = recipe.locale.strip()
+        lines += [
+            "if [ -f /etc/locale.gen ]; then",
+            f"    grep -q '^{locale} ' /etc/locale.gen || printf '%s\n' '{locale} UTF-8' >> /etc/locale.gen",
+            "    if command -v locale-gen > /dev/null 2>&1; then",
+            "        locale-gen > /dev/null 2>&1 || true",
+            "    fi",
+            f"    printf '%s\n' LANG={sh_quote(locale)} > /etc/default/locale",
+            "fi",
+            "",
+        ]
+    if recipe.keyboard:
+        keymap = recipe.keyboard.strip()
+        lines += [
+            "if [ -d /etc/default ]; then",
+            "    cat > /etc/default/keyboard <<'XKB'",
+            f'XKBLAYOUT="{keymap}"',
+            'XKBMODEL="pc105"',
+            'XKBVARIANT=""',
+            'XKBOPTIONS=""',
+            "XKB",
+            "fi",
+            "if [ -d /usr/lib/systemd ]; then",
+            f"    printf '%s\n' KEYMAP={sh_quote(keymap)} > /etc/vconsole.conf",
+            "fi",
+            "",
+        ]
+    if recipe.apt_sources:
+        lines += [
+            "if [ -d /etc/apt ]; then",
+            "    cat > /etc/apt/sources.list.d/os-maker.list <<'OSMAKER_SOURCES'",
+        ]
+        lines += [line.strip() for line in recipe.apt_sources if line.strip()]
+        lines += ["OSMAKER_SOURCES", "fi", ""]
+    if recipe.remove_packages:
+        names = " ".join(sh_quote(item.strip()) for item in recipe.remove_packages if item.strip())
+        lines += [
+            "if command -v apt-get > /dev/null 2>&1; then",
+            f"    apt-get purge -y --auto-remove {names} > /dev/null 2>&1 || true",
+            "fi",
+            "",
+        ]
+    if recipe.grub_timeout != 5:
+        timeout = recipe.grub_timeout
+        lines += [
+            "if [ -f /etc/default/grub ]; then",
+            f"    sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT={timeout}/' /etc/default/grub",
+            f"    sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE={('hidden' if timeout == 0 else 'menu')}/' /etc/default/grub",
+            "    if command -v grub-mkconfig > /dev/null 2>&1; then",
+            "        grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true",
+            "    fi",
+            "fi",
+            "",
+        ]
+    return lines
+
+
+def sh_quote(value: str) -> str:
+    """Quote a single word for /bin/sh, given the validators already confined its alphabet."""
+    return "'" + value.replace("'", "'\\''") + "'"
 
 
 @dataclass(frozen=True)
@@ -1036,8 +1546,9 @@ class Branding:
     copies: tuple[tuple[Path, str], ...]
     hook: Path
     wallpaper: Path | None
-    size: tuple[int, int]
-    bytes: int
+    record: Path | None = None
+    size: tuple[int, int] = (0, 0)
+    bytes: int = 0
 
 
 def make_branding(recipe: Recipe, directory: Path) -> Branding:
@@ -1056,6 +1567,12 @@ def make_branding(recipe: Recipe, directory: Path) -> Branding:
     (directory / "motd").write_text(recipe.display_motd, encoding="utf-8")
     (directory / "issue").write_text(boot_issue_text(recipe), encoding="utf-8")
     (directory / "os-release").write_text(os_release_text(recipe), encoding="utf-8")
+    record: Path | None = None
+    if recipe.with_branding_record:
+        # a machine-readable card in the image: what a guest can read to find out who
+        # built it, and the one thing CI can grep to prove the branding arrived
+        record = directory / "os-maker.json"
+        record.write_text(recipe.branding_record, encoding="utf-8")
     hook = directory / "branding.hook.chroot"
     hook.write_text(branding_hook_text(recipe), encoding="utf-8")
     with contextlib.suppress(OSError):  # mode bits are a nicety; Windows has none
@@ -1065,6 +1582,8 @@ def make_branding(recipe: Recipe, directory: Path) -> Branding:
         (directory / "issue", "/etc/issue"),
         (directory / "os-release", "/etc/os-release"),
     ]
+    if record is not None:
+        copies.append((record, "/etc/os-maker.json"))
     if wallpaper is not None:
         copies.insert(0, (wallpaper, "/usr/share/backgrounds/os-maker.png"))
     used = [path for path, _ in copies] + [hook]
@@ -1072,6 +1591,7 @@ def make_branding(recipe: Recipe, directory: Path) -> Branding:
         copies=tuple(copies),
         hook=hook,
         wallpaper=wallpaper,
+        record=record,
         size=size,
         bytes=sum(path.stat().st_size for path in used if path.exists()),
     )
@@ -1329,6 +1849,204 @@ class BuildRun:
         return 0.0 if not self.started_at else time.time() - self.started_at
 
 
+def example_recipes() -> list[Path]:
+    """Recipes shipped next to the scripts, sorted, missing folder tolerated.
+
+    The GUI's "open an example" menu and ``--batch`` both need this list, and neither
+    should fail because somebody cloned the repo without the examples directory.
+    """
+    folder = HERE / "examples"
+    try:
+        return sorted(path for path in folder.glob("*.json") if path.is_file())
+    except OSError:
+        return []
+
+
+def revalidate(recipe: Recipe, changes: Mapping[str, object]) -> Recipe:
+    """A copy of a recipe with some fields set, run back through the loader's checks.
+
+    ``dataclasses.replace`` cannot express ``**dict[str, object]`` to a strict type
+    checker -- but re-checking is the point: ``--fix`` must not be able to invent a
+    recipe that would not have loaded in the first place.
+    """
+    if not changes:
+        return recipe
+    tidied = Recipe.from_dict({**asdict(recipe), **dict(changes)})
+    tidied.base_dir = recipe.base_dir
+    return tidied
+
+
+def apply_environment(recipe: Recipe) -> Recipe:
+    """Fill in the folders and container mode from the environment, when unset.
+
+    ``OS_BUILDER_OUTPUT``, ``_WORK``, ``_CACHE``, ``_CONTAINER`` and ``_TIMEOUT`` let a
+    build server or a container set the plumbing once, without editing recipes. Only
+    empty fields are touched: a recipe that says something wins.
+    """
+    changes: dict[str, object] = {}
+    for key, field_name in (
+        ("OS_BUILDER_OUTPUT", "output_dir"),
+        ("OS_BUILDER_WORK", "work_dir"),
+        ("OS_BUILDER_CACHE", "cache_dir"),
+        ("OS_BUILDER_CONTAINER", "container"),
+    ):
+        value = os.environ.get(key, "").strip()
+        if value and not getattr(recipe, field_name):
+            changes[field_name] = value
+    timeout = os.environ.get("OS_BUILDER_TIMEOUT", "").strip()
+    if timeout.isdigit() and 30 <= int(timeout) <= 7200:
+        changes["boot_timeout"] = int(timeout)
+    return revalidate(recipe, changes)
+
+
+HINTS: tuple[tuple[str, str], ...] = (
+    ("no space left on device", "the workspace filled up: point work_dir somewhere with 20 GiB or more"),
+    (
+        "cannot connect to the docker daemon",
+        "Docker is not running for this user: start it, or run build_os.py where live-build is installed",
+    ),
+    (
+        "permission denied",
+        "a permission problem reading the workspace: if Docker is involved, the user usually needs the docker group",
+    ),
+    (
+        "unable to locate package",
+        "a package name is not in this release: check the spelling and the release field",
+    ),
+    (
+        "failed to fetch",
+        "an apt source could not be fetched: check the release, and any extra sources you added",
+    ),
+    ("no_pubkey", "an apt repository's signing key is missing; add it, or drop the source"),
+    ("gpgv", "a repository signature could not be verified: an extra apt source may be unsigned"),
+    ("boot test", "the boot test timed out: raise boot_timeout before blaming the image"),
+)
+
+
+def hint_from_log(lines: Iterable[str]) -> str:
+    """One actionable sentence for the first known failure pattern in a log."""
+    haystack = "\n".join(lines).lower()
+    for needle, hint in HINTS:
+        if needle in haystack:
+            return hint
+    return ""
+
+
+def normalise(recipe: Recipe) -> tuple[Recipe, list[str]]:
+    """The same recipe with its untidy parts tidied, and a note about each one.
+
+    Used by ``--fix`` so a hand-edited JSON file can be made canonical without opening
+    the GUI -- and so two recipes that mean the same thing can be compared at all.
+    """
+    changes: list[str] = []
+    updates: dict[str, object] = {}
+    for field_name in (
+        "name",
+        "tagline",
+        "hostname",
+        "release",
+        "architecture",
+        "preset",
+        "compression",
+        "container",
+        "accent",
+        "wallpaper_style",
+        "wallpaper_size",
+        "version",
+        "author",
+        "home_url",
+        "locale",
+        "keyboard",
+        "timezone",
+        "kernel",
+        "picture_options",
+    ):
+        value = getattr(recipe, field_name)
+        stripped = value.strip()
+        if field_name == "accent":
+            stripped = stripped.lower()
+        if field_name == "wallpaper_size" and stripped:
+            parsed = parse_size(stripped)
+            if parsed is not None:
+                stripped = f"{parsed[0]}x{parsed[1]}"
+        if stripped != value:
+            changes.append(f"{field_name}: {value!r} -> {stripped!r}")
+            updates[field_name] = stripped
+    for field_name in ("packages", "apt_sources", "remove_packages", "files", "hooks"):
+        entries = getattr(recipe, field_name)
+        tidied: list[str] = []
+        for entry in entries:
+            name = entry.strip()
+            if name and name not in tidied:
+                tidied.append(name)
+        if tidied != entries:
+            changes.append(f"{field_name}: {len(entries)} entries -> {len(tidied)}")
+            updates[field_name] = tidied
+    if recipe.motd.strip() and not recipe.motd.endswith("\n"):
+        changes.append("motd: the trailing newline was missing")
+        updates["motd"] = recipe.motd.rstrip("\n") + "\n"
+    if recipe.hostname and recipe.hostname == hostname_for(recipe.name):
+        changes.append("hostname: matches the name, so it can stay blank")
+        updates["hostname"] = ""
+    return revalidate(recipe, updates), changes
+
+
+def diff_recipes(earlier: Recipe, later: Recipe) -> list[str]:
+    """Field-level differences between two recipes, as lines a human can read."""
+    lines: list[str] = []
+    for name in Recipe.__dataclass_fields__:
+        first, second = getattr(earlier, name), getattr(later, name)
+        if first == second:
+            continue
+        if isinstance(first, list) or isinstance(second, list):
+            before = set(first if isinstance(first, list) else [first])
+            after = set(second if isinstance(second, list) else [second])
+            added = ", ".join(sorted(after - before))
+            removed = ", ".join(sorted(before - after))
+            detail = ", ".join(
+                part for part in (f"+{added}" if added else "", f"-{removed}" if removed else "") if part
+            )
+            lines.append(f"{name}: {detail or '(reordered)'}")
+        else:
+            lines.append(f"{name}: {first!r} -> {second!r}")
+    return lines
+
+
+# fields mapped to what they become: documentation the code can be checked against
+# The left column of ``--explain``; long names would run into the description, so the
+# table is printed at this width and a test keeps every name inside it.
+EXPLAIN_NAME_WIDTH = 42
+
+EXPLANATIONS: tuple[tuple[str, str], ...] = (
+    ("name", "--name, the ISO label, and the hostname when that is blank"),
+    ("tagline", "the login banner, /etc/issue and os-release's VERSION"),
+    ("hostname", "/etc/hostname, written by the branding hook"),
+    ("motd", "/etc/motd, verbatim, with the block name above it when motd_art is on"),
+    ("release / architecture / compression", "--release, --architecture, --compression"),
+    ("preset", "the starting package list; nothing on the command line itself"),
+    ("packages", "--packages, after the preset's own and the chosen kernel"),
+    ("files", "--copy SOURCE:DEST, resolved against this recipe's folder"),
+    ("hooks", "--hook, before the generated branding hook"),
+    ("kernel", "a linux-image-* package added to the list ('auto' lets Debian choose)"),
+    ("apt_sources", "/etc/apt/sources.list.d/os-maker.list, from the branding hook"),
+    ("remove_packages", "apt-get purge --auto-remove in the chroot hook"),
+    ("locale / keyboard / timezone", "/etc/default/locale, /etc/default/keyboard, /etc/localtime"),
+    ("grub_timeout", "GRUB_TIMEOUT in /etc/default/grub; 0 hides the menu"),
+    ("version / author / home_url", "PRETTY_NAME, VERSION_ID, OS_MAKER_MAINTAINER, HOME_URL"),
+    ("accent / wallpaper_style / wallpaper_size", "the generated PNG and os-release's OS_MAKER_ACCENT"),
+    ("wallpaper_seed", "which variation of an organic style is drawn; same seed, same picture"),
+    ("show_wordmark", "whether the name is stamped onto the wallpaper at all"),
+    ("picture_options", "the desktop's background fit, in dconf and in XFCE's XML"),
+    ("with_branding_record", "/etc/os-maker.json, carrying this recipe's digest"),
+    ("with_firmware / with_wallpaper", "--with-firmware, and whether the PNG is generated"),
+    ("container / boot_test / boot_timeout", "--container, --boot-test, --boot-timeout"),
+    ("keep_work / skip_checks", "--keep-work, --skip-checks"),
+    ("work_dir / cache_dir", "--work-dir, --cache-dir; both next to the ISO when blank"),
+    ("output_dir", "where the ISO lands, default dist/ (OS_BUILDER_OUTPUT can set it)"),
+    ("notes", "nothing: recipe-only, for whoever reads it next"),
+)
+
+
 def engine_hint() -> str:
     """One line about whether this machine can actually build right now."""
     if shutil.which("lb") and platform.system() == "Linux" and hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -1519,12 +2237,17 @@ class RecipeModel:
 # command line (the GUI is in os_builder_gui.py, imported only when wanted)
 # --------------------------------------------------------------------------- #
 def load_recipe(path: Path | None, *, preset: str | None = None) -> Recipe:
-    """The recipe to start the GUI with: a file, a preset, or the defaults."""
+    """The recipe to start the GUI with: a file, a preset, or the defaults.
+
+    Environment defaults are applied here too, so the GUI and --build agree about what
+    a recipe means: a folder set in the shell must not change the build but not the
+    window's own account of it.
+    """
     if path is not None:
-        return Recipe.from_file(path)
+        return apply_environment(Recipe.from_file(path))
     if preset is not None:
-        return Recipe.for_preset(preset)
-    return Recipe()
+        return apply_environment(Recipe.for_preset(preset))
+    return apply_environment(Recipe())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1559,12 +2282,64 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout", type=int, default=7200, metavar="SECONDS", help="--build limit (default 2h)"
     )
     parser.add_argument("--keep-work", action="store_true", help="with --build: keep the workspace")
+
+    machine = parser.add_argument_group("for scripts")
+    machine.add_argument(
+        "--json", action="store_true", help="with --check/--preview/--build: one JSON object on stdout"
+    )
+    machine.add_argument("--quiet", action="store_true", help="with --build: do not echo the builder's log")
+    machine.add_argument(
+        "--tail",
+        type=int,
+        default=0,
+        metavar="N",
+        help="with --build --quiet: repeat the last N log lines when the build fails",
+    )
+    machine.add_argument(
+        "--stall-notice",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help="with --build: say so when the builder has printed nothing for this long",
+    )
+
+    tools = parser.add_argument_group("recipe tools")
+    tools.add_argument("--fix", type=Path, metavar="FILE", help="print the canonical form of a recipe")
+    tools.add_argument(
+        "--diff", type=Path, nargs=2, metavar=("A", "B"), help="print what differs between two recipes"
+    )
+    tools.add_argument("--batch", type=Path, metavar="DIR", help="check every recipe in a directory")
+    tools.add_argument("--preset-info", metavar="KEY", help="one preset in full")
+    tools.add_argument("--explain", action="store_true", help="what each recipe field turns into")
+    tools.add_argument(
+        "--gui-check", action="store_true", help="report whether this machine can show the GUI"
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.explain:
+        for name, meaning in EXPLANATIONS:
+            print(f"  {name:<{EXPLAIN_NAME_WIDTH}}{meaning}")
+        return 0
+
+    if args.gui_check:
+        return gui_check()
+
+    if args.preset_info:
+        return preset_info(args.preset_info)
+
+    if args.diff is not None:
+        return diff_recipes_and_report(args.diff[0], args.diff[1])
+
+    if args.batch is not None:
+        return batch_check(args.batch)
+
     if args.list_presets:
+        if args.json:
+            print(json.dumps([asdict(preset) for preset in PRESETS.values()], indent=2))
+            return 0
         for key, preset in PRESETS.items():
             print(f"{key:<12} {preset.label}")
             print(f"{'':<12}{preset.blurb}")
@@ -1578,14 +2353,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"os-builder: wrote {destination}  (edit it, then: os_builder.py --preview {destination})")
         return 0
 
+    if args.fix is not None:
+        return fix_recipe(args.fix, args.out)
+
     if args.check is not None:
-        return max((check_recipe(path) for path in args.check), default=0)
+        return max((check_recipe(path, as_json=args.json) for path in args.check), default=0)
 
     if args.wallpaper is not None:
         return write_wallpaper(args.wallpaper, args.out)
 
     if args.preview is not None:
-        return preview(args.preview)
+        return preview(args.preview, as_json=args.json)
 
     if args.build is not None:
         return headless_build(args)
@@ -1595,18 +2373,142 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def load_or_report(path: Path) -> Recipe | int:
     try:
-        return Recipe.from_file(path)
+        return apply_environment(Recipe.from_file(path))
     except RecipeError as exc:
         print(f"os-builder: {exc}", file=sys.stderr)
         return 1
 
 
-def check_recipe(path: Path) -> int:
+def recipe_report(recipe: Recipe, path: Path | None = None, *, dry_run: bool = False) -> dict[str, object]:
+    """Everything ``--json`` says about one recipe.
+
+    ``--preview`` passes ``dry_run`` so the command it hands to a script is the command
+    that would actually run, ``--dry-run`` and all.
+    """
+    return {
+        "file": str(path) if path is not None else "",
+        "digest": recipe.digest(),
+        "ready": not recipe.problems(),
+        "problems": recipe.problems(),
+        "release": recipe.release,
+        "architecture": recipe.architecture,
+        "packages": recipe.merged_packages(),
+        "wallpaper_size": recipe.wallpaper_size,
+        "hostname": recipe.resolved_hostname,
+        "command": recipe_to_argv(recipe, dry_run=dry_run),
+    }
+
+
+def fix_recipe(path: Path, out: Path | None) -> int:
+    """Print (and optionally write) the canonical form of a recipe."""
+    loaded = load_or_report(path)
+    if isinstance(loaded, int):
+        return loaded
+    tidied, changes = normalise(loaded)
+    for change in changes:
+        print(f"os-builder: {change}")
+    problems = tidied.problems()
+    if not changes:
+        print("os-builder: nothing to tidy")
+    if out is None:
+        print(tidied.to_json(), end="")
+        if changes:
+            print("os-builder: pass --out FILE to keep this, the file itself was not touched")
+    else:
+        try:
+            tidied.save(out)
+        except RecipeError as exc:
+            print(f"os-builder: {exc}", file=sys.stderr)
+            return 2
+        print(f"os-builder: wrote {out} ({len(changes)} change(s))")
+    for problem in problems:
+        print(f"os-builder: still not buildable: {problem}", file=sys.stderr)
+    return 2 if problems else 0
+
+
+def diff_recipes_and_report(first: Path, second: Path) -> int:
+    left = load_or_report(first)
+    if isinstance(left, int):
+        return left
+    right = load_or_report(second)
+    if isinstance(right, int):
+        return right
+    lines = diff_recipes(left, right)
+    if not lines:
+        print(f"os-builder: {first.name} and {second.name} describe the same build")
+        return 0
+    print(f"os-builder: {first.name} -> {second.name}")
+    for line in lines:
+        print(f"  {line}")
+    return 1
+
+
+def batch_check(folder: Path) -> int:
+    """Check every recipe in a directory: the shape of a nightly image job."""
+    if not folder.is_dir():
+        print(f"os-builder: {folder} is not a directory", file=sys.stderr)
+        return 2
+    recipes = sorted(folder.glob("*.json"))
+    if not recipes:
+        print(f"os-builder: no recipes (*.json) in {folder}", file=sys.stderr)
+        return 2
+    worst = 0
+    for path in recipes:
+        worst = max(worst, check_recipe(path))
+    print(f"os-builder: checked {len(recipes)} recipe(s) in {folder}")
+    return worst
+
+
+def preset_info(key: str) -> int:
+    preset = PRESETS.get(key)
+    if preset is None:
+        print(f"os-builder: no preset called {key!r} (try: {', '.join(PRESETS)})", file=sys.stderr)
+        return 2
+    print(f"{preset.key}: {preset.label}")
+    print(f"  {preset.blurb}")
+    print(f"  packages: {', '.join(preset.packages) or 'none'}")
+    print(f"  desktop task: {preset.desktop or 'no desktop'}")
+    print(f"  firmware on by default: {'yes' if preset.firmware else 'no'}")
+    print(f"  accent {preset.accent}, wallpaper style {preset.wallpaper}")
+    return 0
+
+
+def gui_check() -> int:
+    """Say whether this machine can show the GUI, and why not if it cannot."""
+    print(f"os-builder: {__version__}, python {platform.python_version()}, {platform.system()}")
+    try:
+        import tkinter
+    except ImportError:
+        print("  no tkinter: install python3-tk (Debian/Ubuntu), or use --check/--preview/--build")
+        return 1
+    print(f"  tkinter {tkinter.TkVersion}.{tkinter.TclVersion if hasattr(tkinter, 'TclVersion') else '?'}")
+    try:
+        probe = tkinter.Tk()
+    except Exception as exc:  # TclError on a headless box, and worth naming either way
+        print(f"  cannot open a display ({exc}): use --preview and --build, or run under a desktop")
+        return 1
+    try:
+        probe.update_idletasks()
+        print(f"  display ok, {int(probe.winfo_screenwidth())}x{int(probe.winfo_screenheight())} screen")
+        try:
+            scaling = float(probe.call("tk", "scaling"))
+            print(f"  {scaling:.2f} pixels per point; the preview adapts to this")
+        except Exception:
+            print("  could not read the display scaling; the preview uses its default size")
+    finally:
+        probe.destroy()
+    return 0
+
+
+def check_recipe(path: Path, *, as_json: bool = False) -> int:
     """Validate one recipe file, printing every reason it would not build."""
     recipe = load_or_report(path)
     if isinstance(recipe, int):
         return recipe
     problems = recipe.problems()
+    if as_json:
+        print(json.dumps(recipe_report(recipe, path), indent=2, sort_keys=True))
+        return 0 if not problems else 2
     if not problems:
         packages = len(recipe.merged_packages())
         print(
@@ -1630,10 +2532,14 @@ def write_wallpaper(path: Path, out: Path | None) -> int:
     return 0
 
 
-def preview(path: Path) -> int:
+def preview(path: Path, *, as_json: bool = False) -> int:
     loaded = load_or_report(path)
     if isinstance(loaded, int):
         return loaded
+    if as_json:
+        # no child process here: a script wants the command line, not a wall of text
+        print(json.dumps(recipe_report(loaded, path, dry_run=True), indent=2, sort_keys=True))
+        return 0 if not loaded.problems() else 2
     for problem in loaded.problems():
         print(f"os-builder: warning: {problem}", file=sys.stderr)
     scratch = Path(tempfile.mkdtemp(prefix="os-builder-"))
@@ -1665,19 +2571,40 @@ def headless_build(args: argparse.Namespace) -> int:
     scratch = Path(tempfile.mkdtemp(prefix="os-builder-"))
     run: BuildRun | None = None
     status = 1
-    deadline = time.monotonic() + max(1, args.timeout)
+    # getattr, not args.x: a caller assembling a Namespace by hand (a test, another
+    # tool) should not have to know about every flag this function happens to like
+    quiet = bool(getattr(args, "quiet", False))
+    tail: deque[str] = deque(maxlen=max(0, int(getattr(args, "tail", 0))))
+    stall_after = max(0, int(getattr(args, "stall_notice", 0)))
+    started = time.monotonic()
+    deadline = started + max(1, args.timeout)
+    last_output = started
+    warned_stall = False
+    artifacts: list[Artifact] = []
     try:
         try:
             branding = make_branding(recipe, scratch / "branding")
             run = BuildRun(recipe_to_argv(recipe, branding=branding.copies, hook=branding.hook), cwd=HERE)
-            print(f"os-builder: {describe_argv(run.argv)}", flush=True)
-            print(f"os-builder: {engine_hint()}", flush=True)
+            if not quiet:
+                print(f"os-builder: {describe_argv(run.argv)}", flush=True)
+                print(f"os-builder: {engine_hint()}", flush=True)
             run.start()
         except RecipeError as exc:
             print(f"os-builder: {exc}", file=sys.stderr)
             return 2
         while run.running:
-            echo_lines(run)
+            if echo_lines(run, echo=not quiet, sink=tail):
+                last_output = time.monotonic()
+                warned_stall = False
+            elif stall_after and not warned_stall and time.monotonic() - last_output > stall_after:
+                # a build that prints nothing for minutes is usually fetching a package
+                # index or waiting on a lock; say so, rather than looking hung
+                print(
+                    f"os-builder: still running, nothing printed for {stall_after}s ({run.progress.label})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                warned_stall = True
             if time.monotonic() > deadline:
                 print("os-builder: timed out; asking the builder to stop", file=sys.stderr)
                 status = 1
@@ -1692,18 +2619,43 @@ def headless_build(args: argparse.Namespace) -> int:
         if run is not None:
             if run.running:
                 run.stop()
-            echo_lines(run)
-            for artifact in list_artifacts(recipe.resolved_output_dir, since=run.started_at):
-                print(f"os-builder: {artifact.kind}: {artifact.path} ({artifact.human_size})")
+            echo_lines(run, echo=not quiet, sink=tail)
+            artifacts = list_artifacts(recipe.resolved_output_dir, since=run.started_at)
         shutil.rmtree(scratch, ignore_errors=True)
+        if status != 0:
+            for line in list(tail) if quiet else ():
+                print(line)
+            hint = hint_from_log(run.log if run is not None else ())
+            if hint:
+                print(f"os-builder: hint: {hint}", file=sys.stderr)
+        if getattr(args, "json", False):
+            summary = {
+                "status": status,
+                "seconds": round(time.monotonic() - started, 1),
+                "digest": recipe.digest(),
+                "command": list(run.argv) if run is not None else [],
+                "artifacts": [
+                    {"kind": item.kind, "path": str(item.path), "size": item.size} for item in artifacts
+                ],
+            }
+            print(json.dumps(summary, indent=2, sort_keys=True))
+        for artifact in artifacts:
+            print(f"os-builder: {artifact.kind}: {artifact.path} ({artifact.human_size})")
     return status
 
 
-def echo_lines(run: BuildRun) -> int:
-    """Print whatever the builder has written so far; returns the line count."""
+def echo_lines(run: BuildRun, *, echo: bool = True, sink: deque[str] | None = None) -> int:
+    """Drain the builder's log: print it, keep the tail, or both.
+
+    Draining is not optional even when ``echo`` is off -- the child's stdout blocks
+    once the pipe fills, so a quiet build that never reads would hang the build.
+    """
     lines = run.drain()
     for line in lines:
-        print(line, flush=True)
+        if sink is not None:
+            sink.append(line)
+        if echo:
+            print(line, flush=True)
     return len(lines)
 
 

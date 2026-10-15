@@ -25,6 +25,10 @@
   "output_dir": "",
   "work_dir": "",
   "cache_dir": "",
-  "notes": "A live arcade: boots, plays, leaves no trace.",
-  "recipe_version": 1
+  "notes": "A live arcade: boots, plays, leaves no trace. GRUB is silenced to 0 seconds because a kiosk should not wait for a keystroke.",
+  "recipe_version": 1,
+  "grub_timeout": 0,
+  "motd_art": true,
+  "kernel": "generic",
+  "timezone": "Europe/Berlin"
 }

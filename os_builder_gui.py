@@ -12,6 +12,7 @@ Run it with ``python3 os_builder.py``.
 from __future__ import annotations
 
 import contextlib
+import random
 import re
 import subprocess
 import sys
@@ -237,6 +238,12 @@ class BuilderGUI:
         file_menu.add_command(
             label="Save recipe as...", command=lambda: self._save(as_file=True), accelerator="Ctrl+Shift+S"
         )
+        examples = tk.Menu(file_menu, tearoff=0)
+        for path in ob.example_recipes():
+            examples.add_command(label=path.stem, command=self._example_loader(path))
+        if not examples.index("end"):  # nothing shipped next to this script: say so, do not lie
+            examples.add_command(label="no examples found", state="disabled")
+        file_menu.add_cascade(label="open an example", menu=examples)
         file_menu.add_separator()
         file_menu.add_command(label="Quit", command=self._on_close, accelerator="Ctrl+Q")
         menu.add_cascade(label="file", menu=file_menu)
@@ -263,10 +270,23 @@ class BuilderGUI:
             "Control-p": lambda _event: self._dry_run(),
             "Control-b": lambda _event: self._start_build(),
             "Control-q": lambda _event: self._on_close(),
+            "Control-e": lambda _event: self._show_argv(),
             "Escape": lambda _event: self._stop(),
+            "F1": lambda _event: self._shortcuts(),
         }
+        # one keystroke per tab, in order: a person building the same recipe twice
+        # should never have to find the tab with the mouse
+        for index in range(len(ob.TAB_NAMES)):
+            bindings[f"Alt-{index + 1}"] = self._tab_jumper(index)
         for sequence, handler in bindings.items():
             self.root.bind_all(sequence, handler)
+
+    def _tab_jumper(self, index: int) -> Callable[[object], None]:
+        def select(_event: object) -> None:
+            with contextlib.suppress(Exception):  # a notebook with fewer tabs is fine
+                self.notebook.select(index)
+
+        return select
 
     # ------------------------------------------------------------- widget makers
     def _entry(self, row: tk.Misc, *, variable: tk.Variable, width: int) -> tk.Entry:
@@ -406,6 +426,7 @@ class BuilderGUI:
     def _build_tabs(self) -> None:
         self._identity_tab()
         self._software_tab()
+        self._system_tab()
         self._appearance_tab()
         self._files_tab()
         self._build_tab()
@@ -510,6 +531,67 @@ class BuilderGUI:
             hint="Needed by some Wi-Fi and GPU drivers that live outside the main archive.",
         )
 
+    def _system_tab(self) -> None:
+        tab = self._tab(
+            "system",
+            "What the machine does once it boots: locale, keyboard, clock, kernel and the extra "
+            "software decisions build_os.py has no flag for.",
+        )
+        holder = ttk.Frame(tab)
+        holder.pack(fill="both", expand=True)
+        left = ttk.Frame(holder)
+        left.pack(side="left", fill="y")
+        right = ttk.Frame(holder)
+        right.pack(side="left", fill="both", expand=True, padx=(16, 0))
+
+        behaviour = self._card(left, "on the machine")
+        self._field(
+            behaviour,
+            "locale",
+            "locale",
+            hint="Blank keeps Debian's default. Written to /etc/default/locale and locale.gen.",
+        )
+        self._field(behaviour, "keyboard", "keyboard", hint="A console keymap name, like gb, de or fr.")
+        self._field(
+            behaviour,
+            "timezone",
+            "timezone",
+            hint="A zoneinfo path, like Europe/London. Linked into /etc/localtime.",
+        )
+        self._choice(right, "kernel", "kernel", ob.KERNELS, label_width=12)
+        self._choice(right, "picture_options", "background", ob.PICTURE_OPTIONS, label_width=12)
+        self._number(
+            right,
+            "grub_timeout",
+            "boot menu",
+            lo=0,
+            hi=120,
+            width=6,
+            hint="Seconds the boot menu waits. 0 hides it, which is what a kiosk wants.",
+        )
+
+        label_row = self._card(right, "versions and credit")
+        self._field(label_row, "version", "version", hint="Goes into PRETTY_NAME and VERSION_ID, like 2.1.")
+        self._field(label_row, "author", "maintainer", hint="Recorded in os-release as OS_MAKER_MAINTAINER.")
+        self._field(
+            label_row,
+            "home_url",
+            "home page",
+            hint="HOME_URL and SUPPORT_URL in the image. Blank points at this project.",
+        )
+        self._check(
+            label_row,
+            "with_branding_record",
+            "leave /etc/os-maker.json in the image",
+            hint="A machine-readable card: name, accent, preset and the recipe's digest.",
+        )
+
+        software = self._card(right, "sources and removals")
+        self._multiline(
+            software, "apt_sources", "extra apt sources, one 'deb https://host suite comp' a line"
+        )
+        self._multiline(software, "remove_packages", "packages to purge during the build, one a line")
+
     def _appearance_tab(self) -> None:
         tab = self._tab(
             "appearance", "The generated wallpaper, login banner and branding. The preview is live."
@@ -548,14 +630,16 @@ class BuilderGUI:
 
         styles = self._card(left, "wallpaper")
         style_var = tk.StringVar(value=self.model.recipe.wallpaper_style)
-        for name in ob.WALLPAPER_STYLES:
+        for index, name in enumerate(ob.WALLPAPER_STYLES):
+            # two columns, because eleven styles in one stack makes this window taller
+            # than most laptops are
             ttk.Radiobutton(
                 styles,
                 text=name,
                 value=name,
                 variable=style_var,
                 command=lambda: self.model.set(wallpaper_style=style_var.get()),
-            ).pack(anchor="w", pady=1)
+            ).grid(row=index // 2, column=index % 2, sticky="w", pady=1, padx=(0, 14))
         self.vars["wallpaper_style"] = style_var
         self._field(
             styles,
@@ -567,9 +651,26 @@ class BuilderGUI:
         self._check(
             styles,
             "with_wallpaper",
-            "stamp the name onto the wallpaper",
-            hint="Off gives you a clean, textless image.",
+            "generate a wallpaper and put it in the image",
+            hint="It travels to /usr/share/backgrounds and is registered with the desktop.",
         )
+        self._check(
+            styles,
+            "show_wordmark",
+            "stamp the name onto it",
+            hint="Off gives a clean, textless image.",
+        )
+        self._check(
+            styles,
+            "motd_art",
+            "draw the name in the login banner too",
+            hint="Block letters above /etc/motd, using the same 5x7 face as the wallpaper.",
+        )
+        self._number(styles, "wallpaper_seed", "seed", lo=0, hi=999999, width=8, hint="")
+        roll = ttk.Frame(styles)
+        roll.pack(anchor="w", pady=(4, 0))
+        ttk.Button(roll, text="roll the seed", command=self._roll_seed).pack(side="left")
+        ttk.Label(roll, text="same seed, same picture", style="CardDim.TLabel").pack(side="left", padx=8)
 
         preview_card = self._card(right, "preview")
         self.canvas = tk.Canvas(
@@ -586,6 +687,12 @@ class BuilderGUI:
         ttk.Button(buttons, text="save wallpaper PNG...", command=self._export_wallpaper).pack(side="left")
         self.preview_note = ttk.Label(buttons, text="", style="CardDim.TLabel")
         self.preview_note.pack(side="right")
+
+    def _roll_seed(self) -> None:
+        """A new variation of the wallpaper, and a preview that follows it."""
+        self.model.set(wallpaper_seed=random.randrange(1_000_000))
+        self._sync_widgets()
+        self._queue_preview()
 
     def _files_tab(self) -> None:
         tab = self._tab(
@@ -1181,16 +1288,30 @@ class BuilderGUI:
 
     def _shortcuts(self) -> None:
         rows = (
+            ("Alt+1..6", "jump to a tab"),
             ("Ctrl+S", "save the recipe"),
             ("Ctrl+Shift+S", "save the recipe somewhere else"),
             ("Ctrl+O", "open a recipe"),
             ("Ctrl+N", "new recipe from a preset"),
             ("Ctrl+P", "dry run (plan, no build)"),
             ("Ctrl+B", "build the ISO"),
+            ("Ctrl+E", "print the build_os.py command line"),
             ("Esc", "stop a running build"),
+            ("F1", "this list"),
             ("Ctrl+Q", "quit"),
         )
         messagebox.showinfo("keyboard", "\n".join(f"{keys:<16}{what}" for keys, what in rows))
+
+    def _example_loader(self, path: Path) -> Callable[[], None]:
+        def load() -> None:
+            try:
+                self.model.open(path)
+            except ob.RecipeError as exc:
+                messagebox.showerror("cannot open that recipe", str(exc))
+                return
+            self._log(f"loaded {path.name} from the examples folder", tag="ok")
+
+        return load
 
     def _on_close(self) -> None:
         run = self.model.run
