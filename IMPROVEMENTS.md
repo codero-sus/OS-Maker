@@ -13,7 +13,7 @@ python3 os_builder.py --batch examples/         # the shipped recipes all valida
 python3 -m mypy && ruff check .                 # types and lint, no exceptions made
 ```
 
-This round is **58** items. The count is not a target and the number is not the
+This round is **61** items. The count is not a target and the number is not the
 point; the middle column is.
 
 | # | Area | What changed | Where it is proved |
@@ -77,6 +77,9 @@ point; the middle column is.
 | 57 | repo | test doubles are held to the real contract: a fake BuildRun owes .log, because hints read it | the stubs in CliTests, and the failure that proved the point |
 | 58 | repo | README section 3 documents the flags, the tabs and the environment, not just the buttons | README.md, cross-checked against the parser and the tab builders |
 
+| 59 | portability | the hook no longer needs GNU `sed`: the GRUB edit is two `-e` expressions written through a temp file, which BSD `sed` on macOS accepts too (CI caught the old form) | HookExecutionTests.test_the_boot_menu_timeout_is_written_and_hidden_at_zero, and the scratch-file assertion in it |
+| 60 | portability | a filesystem that refuses symlinks cannot fail a build any more: `/etc/timezone` is written first and `ln` is allowed to fail, so the Windows runners pass | test_the_hook_sets_the_clock_the_locale_and_the_keymap probes for symlink support instead of assuming a platform |
+| 61 | testing | the generated hook is syntax-checked by `sh -n` for four feature combinations, so quoting and continuations are validated by a shell rather than by reading | test_the_hook_is_valid_shell_on_this_platform |
 ## What this round did not do
 
 * **Nobody has seen the GUI running.** This environment has no display and no Tk, so the
