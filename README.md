@@ -176,7 +176,7 @@ done   # then tile the five files with any image tool
 | software | preset, the effective package list, ~25 tickable suggestions, your own additions, firmware switch |
 | appearance | accent colour (7 swatches or any hex), five wallpaper styles, resolution, and a **live preview** that redraws as you type |
 | files & hooks | files copied to a path inside the image, shell hooks live-build runs while building |
-| build | output/work/cache folders, QEMU boot test, keep-workspace, skip-checks, and a table of what the build produced with SHA-256 verification |
+| build | output/work/cache folders, QEMU boot test and how long to wait for it, keep-workspace, skip-checks, and a table of what the build produced with SHA-256 verification |
 
 The window adopts the accent colour of the OS you are building, so a "Neon Arcade" recipe really
 does look like one. A live log pane shows the builder's output (colour-coded, auto-scrolling,
@@ -205,6 +205,8 @@ python3 os_builder.py --list-presets
   "accent": "#bc8cff",
   "wallpaper_style": "rays",
   "with_firmware": true,
+  "boot_test": true,
+  "boot_timeout": 420,
   "files": ["banner.txt:/etc/issue.net"]
 }
 ```
@@ -215,9 +217,11 @@ Three ready-made recipes live in [`examples/`](examples) and CI checks all of th
 ### How it is put together
 
 The GUI never reimplements the build. `RecipeModel` holds the state, `make_branding()` generates the
-wallpaper/motd/issue/`os-release` plus a live-build hook, and `BuildRun` runs `build_os.py` as a
-subprocess with the flags the recipe describes — which is exactly what `--build` does from a
-terminal. That means:
+wallpaper plus `/etc/motd`, `/etc/issue` and `/etc/os-release` (which travel as ordinary `--copy`
+entries) and a live-build hook for the two things a file copy cannot do — set `/etc/hostname` and
+register the wallpaper with GNOME's dconf and XFCE's XML profile, so the branding is actually shown
+rather than merely present — and `BuildRun` runs `build_os.py` as a subprocess with the flags the
+recipe describes, which is exactly what `--build` does from a terminal. That means:
 
 * the same recipe works headless, in CI and over SSH, where there is no display;
 * `build_os.py` keeps a single supported entry point, so nothing can drift between the two;

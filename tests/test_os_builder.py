@@ -130,6 +130,9 @@ class RecipeTests(unittest.TestCase):
             ({"hooks": [1]}, "'hooks' must be a list of strings"),
             ({"name": 3}, "'name' must be a string"),
             ({"boot_test": "yes"}, "'boot_test' must be true or false"),
+            ({"boot_timeout": "420"}, "'boot_timeout' must be a whole number of seconds"),
+            ({"boot_timeout": True}, "'boot_timeout' must be a whole number of seconds"),
+            ({"boot_timeout": 4.5}, "'boot_timeout' must be a whole number of seconds"),
         ):
             with self.subTest(payload=payload):
                 with self.assertRaises(os_builder.RecipeError) as caught:
@@ -259,6 +262,25 @@ class ValidationTests(TempDirCase):
     def test_hooks_must_exist(self) -> None:
         recipe = self.recipe(hooks=[str(self.tmp / "nope.sh")])
         self.assertIn("is not a readable file", "\n".join(recipe.problems()))
+
+    def test_the_boot_timeout_has_to_be_sane(self) -> None:
+        """A boot test that waits 5 seconds proves nothing, and waiting a day is absurd."""
+        for seconds in (5, 0, 99999):
+            with self.subTest(seconds=seconds):
+                self.assertIn(
+                    "boot timeout must be a whole number of seconds between 30 and 7200",
+                    self.recipe(boot_timeout=seconds).problems(),
+                )
+        self.assertEqual(self.recipe(boot_timeout=600).problems(), [])
+
+    def test_the_boot_timeout_is_carried_by_a_saved_recipe(self) -> None:
+        saved = self.tmp / "boot.json"
+        os_builder.Recipe(boot_test=True, boot_timeout=540).save(saved)
+        loaded = os_builder.Recipe.from_file(saved)
+        self.assertEqual(loaded.boot_timeout, 540)
+        self.assertIsInstance(loaded.boot_timeout, int)
+        argv = os_builder.recipe_to_argv(loaded)
+        self.assertEqual(argv[argv.index("--boot-timeout") + 1], "540")
 
     def test_a_valid_recipe_has_no_complaints(self) -> None:
         recipe = self.recipe(name="Fine OS", hostname="fine-os", accent="#00ff88", wallpaper_size="800x600")
@@ -417,6 +439,7 @@ class ArgvTests(TempDirCase):
             self.assertEqual(argv[argv.index(option) + 1], value)
         for switch in ("--with-firmware", "--boot-test", "--keep-work", "--skip-checks"):
             self.assertIn(switch, argv)
+        self.assertEqual(argv[argv.index("--boot-timeout") + 1], "300")
         self.assertNotIn("--dry-run", argv)
 
     def test_omitted_options_are_left_out(self) -> None:
@@ -424,6 +447,7 @@ class ArgvTests(TempDirCase):
         for option in (
             "--with-firmware",
             "--boot-test",
+            "--boot-timeout",
             "--keep-work",
             "--skip-checks",
             "--work-dir",
@@ -444,6 +468,25 @@ class ArgvTests(TempDirCase):
         copies = [argv[i + 1] for i, item in enumerate(argv) if item == "--copy"]
         self.assertEqual(len(copies), 2)
         self.assertIn(f"{first.as_posix()}:/w/a.png", copies)
+
+    def test_the_branding_hook_travels_as_the_last_hook(self) -> None:
+        mine = self.tmp / "mine.sh"
+        mine.write_text("#!/bin/sh\n", encoding="utf-8")
+        generated = self.tmp / "branding.hook.chroot"
+        generated.write_text("#!/bin/sh\n", encoding="utf-8")
+        argv = os_builder.recipe_to_argv(
+            self.recipe(hooks=[str(mine)]), branding=[(self.tmp / "w.png", "/bg/w.png")], hook=generated
+        )
+        hooks = [argv[i + 1] for i, item in enumerate(argv) if item == "--hook"]
+        self.assertEqual(len(hooks), 2, "the recipe's own hook, then the generated one")
+        self.assertEqual(Path(hooks[0]).name, "mine.sh")
+        self.assertEqual(Path(hooks[1]).name, "branding.hook.chroot")
+        # nothing reaches the command line twice
+        self.assertEqual(argv.count(str(generated)), 1)
+
+    def test_no_hook_is_invented_when_there_is_no_branding(self) -> None:
+        argv = os_builder.recipe_to_argv(self.recipe())
+        self.assertNotIn("--hook", argv)
 
     def test_dry_run_flag_is_opt_in(self) -> None:
         argv = os_builder.recipe_to_argv(self.recipe(preset="custom"), dry_run=True)
@@ -618,7 +661,9 @@ class BrandingTests(TempDirCase):
         branding = os_builder.make_branding(self.recipe(with_wallpaper=False), self.tmp / "b")
         self.assertIsNone(branding.wallpaper)
         self.assertFalse(any("backgrounds" in destination for _source, destination in branding.copies))
-        self.assertNotIn("wallpaper.png", branding.hook.read_text(encoding="utf-8"))
+        hook_text = branding.hook.read_text(encoding="utf-8")
+        self.assertNotIn("wallpaper.png", hook_text)
+        self.assertNotIn("/usr/share/backgrounds", hook_text, "no wallpaper, no desktop settings")
         self.assertEqual(len(branding.copies), 3)
 
     def test_the_wallpaper_size_setting_is_respected(self) -> None:
@@ -670,9 +715,69 @@ class BrandingTests(TempDirCase):
         text = branding.hook.read_text(encoding="utf-8")
         self.assertTrue(text.startswith("#!/bin/sh"), text[:20])
         self.assertIn("set -eu", text)
-        for destination in ("/etc/motd", "/etc/issue", "/etc/os-release"):
-            self.assertIn(destination, text)
+        self.assertIn("/etc/hostname", text)
         self.assertIn("os-builder: branding installed", text)
+        # the copied files already land at their destinations, so the hook must not
+        # fight them for ownership of /etc
+        for destination in ("/etc/motd", "/etc/issue", "/etc/os-release"):
+            self.assertNotIn(destination, text)
+
+    def test_the_hook_runs_and_writes_the_desktop_settings(self) -> None:
+        """Not just parseable: run it against a fake root and read what it produced."""
+        shell = shutil.which("sh")
+        if shell is None:
+            self.skipTest("no POSIX shell on this machine")
+        branding = os_builder.make_branding(self.recipe(accent="#39d353"), self.tmp / "b")
+        assert branding.wallpaper is not None
+        root = self.tmp / "root"
+        (root / "usr/share/backgrounds").mkdir(parents=True)
+        shutil.copy2(branding.wallpaper, root / "usr/share/backgrounds/os-maker.png")
+        (root / "etc/dconf/db/local.d").mkdir(parents=True)
+        (root / "etc/xdg/xfce4").mkdir(parents=True)
+        script = (
+            branding.hook.read_text(encoding="utf-8")
+            .replace("/etc/", f"{root}/etc/")
+            .replace("/usr/", f"{root}/usr/")
+        )
+        completed = subprocess.run(
+            [shell, "-c", script], capture_output=True, text=True, timeout=30, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("branding installed", completed.stdout)
+        self.assertIn(self.recipe().resolved_hostname, (root / "etc/hostname").read_text(encoding="utf-8"))
+        conf = (root / "etc/dconf/db/local.d/00-os-maker").read_text(encoding="utf-8")
+        self.assertIn("[org/gnome/desktop/background]", conf)
+        self.assertIn("picture-options='zoomed'", conf)
+        self.assertIn("primary-color='#39d353'", conf, "the accent colour reaches the desktop")
+        self.assertIn("picture-uri=", conf)
+        xml = (root / "etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('name="last-image"', xml)
+        self.assertIn("os-maker.png", xml)
+        self.assertIn("user", (root / "etc/dconf/profile/user").read_text(encoding="utf-8"))
+
+    def test_a_hooked_up_minimal_image_is_left_alone(self) -> None:
+        """A headless image has neither dconf nor XFCE, so the hook must be a no-op."""
+        shell = shutil.which("sh")
+        if shell is None:
+            self.skipTest("no POSIX shell on this machine")
+        branding = os_builder.make_branding(self.recipe(), self.tmp / "b")
+        root = self.tmp / "bare"
+        (root / "usr/share/backgrounds").mkdir(parents=True)
+        shutil.copy2(branding.wallpaper, root / "usr/share/backgrounds/os-maker.png")
+        root.joinpath("etc").mkdir()
+        script = (
+            branding.hook.read_text(encoding="utf-8")
+            .replace("/etc/", f"{root}/etc/")
+            .replace("/usr/", f"{root}/usr/")
+        )
+        completed = subprocess.run(
+            [shell, "-c", script], capture_output=True, text=True, timeout=30, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse((root / "etc/dconf").exists(), "no dconf to talk to")
+        self.assertTrue((root / "etc/hostname").is_file(), "the hostname is always worth setting")
 
     def test_make_branding_creates_missing_directories(self) -> None:
         deep = self.tmp / "a" / "b" / "c"
@@ -1763,6 +1868,32 @@ class GuiTests(TempDirCase):
             listed = {"packages", "files", "hooks"}
             unaddressed = set(gui.model.recipe.__dataclass_fields__) - set(gui.vars) - listed
             self.assertEqual(unaddressed, set(), "these recipe fields have no widget")
+            gui._on_close()
+
+    def test_the_timeout_spinbox_keeps_the_field_an_integer(self) -> None:
+        with fake_tkinter() as env:
+            model = self.model()
+            gui = env["gui"].BuilderGUI(model=model)
+            var = gui.vars["boot_timeout"]
+
+            def type_in(text: str) -> None:
+                var.set(text)
+                var.traces[0]("write", "", "")
+
+            self.assertEqual(model.recipe.boot_timeout, 300)
+            type_in("420")
+            self.assertEqual(model.recipe.boot_timeout, 420, "the model must receive an int, not text")
+            type_in("  90 ")
+            self.assertEqual(model.recipe.boot_timeout, 90)
+            type_in("soon")
+            self.assertEqual(model.recipe.boot_timeout, 90, "half-typed numbers stay in the box")
+            type_in("5")
+            self.assertFalse(model.recipe.ready(), "an absurd timeout must block the build")
+            self.assertIn(
+                "boot timeout must be a whole number of seconds between 30 and 7200", model.problems()
+            )
+            type_in("600")
+            self.assertTrue(model.recipe.ready())
             gui._on_close()
 
     def test_widget_edits_flow_into_the_model(self) -> None:

@@ -332,6 +332,24 @@ class BuilderGUI:
         self.vars[key] = var
         var.trace_add("write", lambda *_args: self._push(key, var))
 
+    def _number(
+        self, parent: tk.Misc, key: str, label: str, *, lo: int, hi: int, width: int = 6, hint: str = ""
+    ) -> ttk.Spinbox:
+        """Integer field.  Only a whole number ever reaches the model, so a half-typed
+        value cannot turn into a bogus timeout; the range itself is the model's job."""
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(6, 0))
+        ttk.Label(row, text=label, style="CardDim.TLabel").pack(side="left", padx=(0, 6))
+        var = tk.StringVar(value=str(getattr(self.model.recipe, key)))
+        spin = ttk.Spinbox(row, from_=lo, to=hi, increment=30, textvariable=var, width=width)
+        self.vars[key] = var
+        var.trace_add("write", lambda *_args: self._push_number(key, var))
+        if hint:
+            ttk.Label(parent, text=hint, style="CardDim.TLabel", wraplength=500, justify="left").pack(
+                anchor="w"
+            )
+        return spin
+
     def _check(self, parent: tk.Misc, key: str, label: str, hint: str = "") -> ttk.Checkbutton:
         var = tk.BooleanVar(value=bool(getattr(self.model.recipe, key)))
         box = ttk.Checkbutton(
@@ -619,6 +637,14 @@ class BuilderGUI:
         grid = ttk.Frame(options)
         grid.pack(anchor="w")
         self._check(grid, "boot_test", "boot the ISO in QEMU afterwards")
+        self._number(
+            grid,
+            "boot_timeout",
+            "wait (s)",
+            lo=30,
+            hi=7200,
+            hint="How long the boot test waits for a login prompt. Slow disks want 600 or more.",
+        )
         self._check(
             grid,
             "keep_work",
@@ -671,6 +697,21 @@ class BuilderGUI:
         value = var.get()
         if key == "motd" and isinstance(value, str):
             value = value.rstrip("\n") + "\n" if value.strip() else ""
+        self.model.set(**{key: value})
+
+    def _push_number(self, key: str, var: tk.Variable) -> None:
+        """Widget -> model for :meth:`_number`, keeping the field an ``int``.
+
+        The bounds stay the model's business: :meth:`Recipe.problems` reports an absurd
+        timeout and the Build button disables, which beats the view silently rewriting
+        what the user typed.
+        """
+        if self._syncing:
+            return
+        try:
+            value = int(str(var.get()).strip())
+        except ValueError:
+            return
         self.model.set(**{key: value})
 
     def _push_text(self, key: str, box: tk.Text) -> None:
