@@ -1470,9 +1470,11 @@ def _system_setup_lines(recipe: Recipe) -> list[str]:
         zone = recipe.timezone.strip()
         lines += [
             "if [ -f /usr/share/zoneinfo/" + zone + " ]; then",
-            "    ln -sf /usr/share/zoneinfo/" + zone + " /etc/localtime",
             # the timezone validator already restricts this to path characters
             f"    printf '%s\n' {zone} > /etc/timezone",
+            # the link is the nice-to-have: a filesystem that cannot take symlinks
+            # must not turn a branding hook into a failed build
+            "    ln -sf /usr/share/zoneinfo/" + zone + " /etc/localtime || true",
             "fi",
             "",
         ]
@@ -1521,10 +1523,14 @@ def _system_setup_lines(recipe: Recipe) -> list[str]:
         ]
     if recipe.grub_timeout != 5:
         timeout = recipe.grub_timeout
+        style = "hidden" if timeout == 0 else "menu"
         lines += [
             "if [ -f /etc/default/grub ]; then",
-            f"    sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT={timeout}/' /etc/default/grub",
-            f"    sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE={('hidden' if timeout == 0 else 'menu')}/' /etc/default/grub",
+            f"    sed -e 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT={timeout}/' \\",
+            f"           -e 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE={style}/' \\",
+            "           /etc/default/grub > /etc/default/grub.os-maker && \\",
+            "        cat /etc/default/grub.os-maker > /etc/default/grub && \\",
+            "        rm -f /etc/default/grub.os-maker",
             "    if command -v grub-mkconfig > /dev/null 2>&1; then",
             "        grub-mkconfig -o /boot/grub/grub.cfg > /dev/null 2>&1 || true",
             "    fi",

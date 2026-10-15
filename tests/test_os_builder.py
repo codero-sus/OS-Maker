@@ -451,6 +451,34 @@ class HookExecutionTests(TempDirCase):
             stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             stub.chmod(0o755)
 
+    def can_symlink(self) -> bool:
+        """Whether this filesystem lets us make a symlink, probed rather than assumed."""
+        probe = self.tmp / "symlink-probe"
+        try:
+            os.symlink(self.tmp / "no-such-target", probe)
+        except (OSError, NotImplementedError):
+            return False
+        probe.unlink(missing_ok=True)
+        return True
+
+    def test_the_hook_is_valid_shell_on_this_platform(self) -> None:
+        """Quoting and line continuations are checked by sh itself, not by eyeballing."""
+        shell = shutil.which("sh")
+        if shell is None:
+            self.skipTest("no POSIX shell on this machine")
+        for changes in (
+            {},
+            {"timezone": "Europe/London", "grub_timeout": 0},
+            {"locale": "en_GB.UTF-8", "keyboard": "de", "apt_sources": ["deb https://x trixie main"]},
+            {"remove_packages": ["bluez"], "picture_options": "centered", "motd_art": True},
+        ):
+            with self.subTest(**changes):
+                hook = os_builder.make_branding(self.recipe(name="Syntax", **changes), self.tmp / "syntax")
+                completed = subprocess.run(
+                    [shell, "-n", str(hook.hook)], capture_output=True, text=True, timeout=60, check=False
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def run_hook(
         self, recipe: os_builder.Recipe, *, with_desktop: bool = True, root: Path | None = None
     ) -> tuple[Path, str]:
@@ -516,7 +544,10 @@ class HookExecutionTests(TempDirCase):
         root, _out = self.run_hook(recipe)
         self.assertEqual((root / "etc/hostname").read_text(encoding="utf-8").strip(), "aurora")
         self.assertEqual((root / "etc/timezone").read_text(encoding="utf-8").strip(), "Europe/London")
-        self.assertTrue((root / "etc/localtime").is_symlink(), "the zone is linked, not copied")
+        if self.can_symlink():
+            self.assertTrue((root / "etc/localtime").is_symlink(), "the zone is linked, not copied")
+        else:  # a filesystem that refuses links must not fail the build over it
+            self.assertIn("|| true", os_builder.branding_hook_text(recipe))
         locale_default = (root / "etc/default/locale").read_text(encoding="utf-8")
         self.assertIn("LANG=en_GB.UTF-8", locale_default)
         generated = (root / "etc/locale.gen").read_text(encoding="utf-8")
@@ -569,6 +600,9 @@ class HookExecutionTests(TempDirCase):
         grub = (root / "etc/default/grub").read_text(encoding="utf-8")
         self.assertIn("GRUB_TIMEOUT=0", grub)
         self.assertIn("GRUB_TIMEOUT_STYLE=hidden", grub)
+        self.assertFalse(
+            (root / "etc/default/grub.os-maker").exists(), "the rewrite must leave no scratch file"
+        )
         unchanged = self.recipe(name="Plain")
         root2, _out2 = self.run_hook(unchanged)
         self.assertEqual(
