@@ -722,34 +722,57 @@ class BrandingTests(TempDirCase):
         for destination in ("/etc/motd", "/etc/issue", "/etc/os-release"):
             self.assertNotIn(destination, text)
 
-    def test_the_hook_runs_and_writes_the_desktop_settings(self) -> None:
-        """Not just parseable: run it against a fake root and read what it produced."""
-        shell = shutil.which("sh")
-        if shell is None:
-            self.skipTest("no POSIX shell on this machine")
-        branding = os_builder.make_branding(self.recipe(accent="#39d353"), self.tmp / "b")
+    def _posix_shell(self) -> str | None:
+        return shutil.which("sh")
+
+    def run_hook_against_a_fake_root(
+        self, branding: os_builder.Branding, root: Path, *, with_desktop: bool
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute the generated hook with ``/etc`` and ``/usr`` pointed at a scratch tree.
+
+        The paths stay relative on purpose.  Injecting an absolute fake root instead
+        puts a Windows drive letter into a POSIX script, where the backslashes are
+        escapes, and the redirection lands on ``C:UsersRUNNER~1...`` -- which is how this
+        test first failed on the Windows runners.
+        """
         assert branding.wallpaper is not None
-        root = self.tmp / "root"
         (root / "usr/share/backgrounds").mkdir(parents=True)
         shutil.copy2(branding.wallpaper, root / "usr/share/backgrounds/os-maker.png")
-        (root / "etc/dconf/db/local.d").mkdir(parents=True)
-        (root / "etc/xdg/xfce4").mkdir(parents=True)
-        script = (
-            branding.hook.read_text(encoding="utf-8")
-            .replace("/etc/", f"{root}/etc/")
-            .replace("/usr/", f"{root}/usr/")
+        (root / "etc").mkdir(parents=True, exist_ok=True)
+        if with_desktop:
+            (root / "etc/dconf/db/local.d").mkdir(parents=True)
+            (root / "etc/xdg/xfce4").mkdir(parents=True)
+        # address the fake root by its own name, relative to cwd, so the same script
+        # text works whatever the scratch directory happens to be called
+        here = root.name
+        text = branding.hook.read_text(encoding="utf-8")
+        script = text.replace("/etc/", f"{here}/etc/").replace("/usr/", f"{here}/usr/")
+        shell = self._posix_shell()
+        assert shell is not None
+        return subprocess.run(
+            [shell, "-c", script], cwd=root.parent, capture_output=True, text=True, timeout=60, check=False
         )
-        completed = subprocess.run(
-            [shell, "-c", script], capture_output=True, text=True, timeout=30, check=False
-        )
+
+    def test_the_hook_runs_and_writes_the_desktop_settings(self) -> None:
+        """Not just parseable: run it and read back what it wrote."""
+        if self._posix_shell() is None:
+            self.skipTest("no POSIX shell on this machine")
+        branding = os_builder.make_branding(self.recipe(accent="#39d353"), self.tmp / "b")
+        root = self.tmp / "root"
+        completed = self.run_hook_against_a_fake_root(branding, root, with_desktop=True)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertIn("branding installed", completed.stdout)
-        self.assertIn(self.recipe().resolved_hostname, (root / "etc/hostname").read_text(encoding="utf-8"))
+        self.assertEqual(
+            (root / "etc/hostname").read_text(encoding="utf-8").strip(),
+            self.recipe().resolved_hostname,
+            "the hostname typed in the GUI is what the machine answers to",
+        )
         conf = (root / "etc/dconf/db/local.d/00-os-maker").read_text(encoding="utf-8")
         self.assertIn("[org/gnome/desktop/background]", conf)
         self.assertIn("picture-options='zoomed'", conf)
         self.assertIn("primary-color='#39d353'", conf, "the accent colour reaches the desktop")
-        self.assertIn("picture-uri=", conf)
+        self.assertIn("file://", conf)
+        self.assertIn("os-maker.png", conf, "the wallpaper is what gets shown")
         xml = (root / "etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml").read_text(
             encoding="utf-8"
         )
@@ -757,27 +780,18 @@ class BrandingTests(TempDirCase):
         self.assertIn("os-maker.png", xml)
         self.assertIn("user", (root / "etc/dconf/profile/user").read_text(encoding="utf-8"))
 
-    def test_a_hooked_up_minimal_image_is_left_alone(self) -> None:
-        """A headless image has neither dconf nor XFCE, so the hook must be a no-op."""
-        shell = shutil.which("sh")
-        if shell is None:
+    def test_a_desktopless_image_is_left_alone(self) -> None:
+        """A headless image has neither dconf nor XFCE, so the hook sets the hostname only."""
+        if self._posix_shell() is None:
             self.skipTest("no POSIX shell on this machine")
         branding = os_builder.make_branding(self.recipe(), self.tmp / "b")
         root = self.tmp / "bare"
-        (root / "usr/share/backgrounds").mkdir(parents=True)
-        shutil.copy2(branding.wallpaper, root / "usr/share/backgrounds/os-maker.png")
-        root.joinpath("etc").mkdir()
-        script = (
-            branding.hook.read_text(encoding="utf-8")
-            .replace("/etc/", f"{root}/etc/")
-            .replace("/usr/", f"{root}/usr/")
-        )
-        completed = subprocess.run(
-            [shell, "-c", script], capture_output=True, text=True, timeout=30, check=False
-        )
+        completed = self.run_hook_against_a_fake_root(branding, root, with_desktop=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertFalse((root / "etc/dconf").exists(), "no dconf to talk to")
+        self.assertFalse((root / "etc/dconf").exists(), "there is no dconf to talk to")
+        self.assertFalse((root / "etc/xdg").exists())
         self.assertTrue((root / "etc/hostname").is_file(), "the hostname is always worth setting")
+        self.assertIn("branding installed", completed.stdout)
 
     def test_make_branding_creates_missing_directories(self) -> None:
         deep = self.tmp / "a" / "b" / "c"
