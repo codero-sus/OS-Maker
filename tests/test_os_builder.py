@@ -451,16 +451,6 @@ class HookExecutionTests(TempDirCase):
             stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             stub.chmod(0o755)
 
-    def can_symlink(self) -> bool:
-        """Whether this filesystem lets us make a symlink, probed rather than assumed."""
-        probe = self.tmp / "symlink-probe"
-        try:
-            os.symlink(self.tmp / "no-such-target", probe)
-        except (OSError, NotImplementedError):
-            return False
-        probe.unlink(missing_ok=True)
-        return True
-
     def test_the_hook_is_valid_shell_on_this_platform(self) -> None:
         """Quoting and line continuations are checked by sh itself, not by eyeballing."""
         shell = shutil.which("sh")
@@ -544,10 +534,15 @@ class HookExecutionTests(TempDirCase):
         root, _out = self.run_hook(recipe)
         self.assertEqual((root / "etc/hostname").read_text(encoding="utf-8").strip(), "aurora")
         self.assertEqual((root / "etc/timezone").read_text(encoding="utf-8").strip(), "Europe/London")
-        if self.can_symlink():
-            self.assertTrue((root / "etc/localtime").is_symlink(), "the zone is linked, not copied")
-        else:  # a filesystem that refuses links must not fail the build over it
-            self.assertIn("|| true", os_builder.branding_hook_text(recipe))
+        # Git-for-Windows' ln copies instead of linking unless it is told not to, so the
+        # guarantee is "the clock points at the zone", by whichever mechanism worked
+        localtime = root / "etc/localtime"
+        zone = root / "usr/share/zoneinfo/Europe/London"
+        self.assertTrue(
+            localtime.is_symlink() or (localtime.exists() and localtime.read_bytes() == zone.read_bytes()),
+            "linked where links work, copied where the filesystem refuses them",
+        )
+        self.assertIn("|| true", os_builder.branding_hook_text(recipe), "a refused link cannot fail a build")
         locale_default = (root / "etc/default/locale").read_text(encoding="utf-8")
         self.assertIn("LANG=en_GB.UTF-8", locale_default)
         generated = (root / "etc/locale.gen").read_text(encoding="utf-8")

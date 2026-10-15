@@ -78,7 +78,7 @@ point; the middle column is.
 | 58 | repo | README section 3 documents the flags, the tabs and the environment, not just the buttons | README.md, cross-checked against the parser and the tab builders |
 
 | 59 | portability | the hook no longer needs GNU `sed`: the GRUB edit is two `-e` expressions written through a temp file, which BSD `sed` on macOS accepts too (CI caught the old form) | HookExecutionTests.test_the_boot_menu_timeout_is_written_and_hidden_at_zero, and the scratch-file assertion in it |
-| 60 | portability | a filesystem that refuses symlinks cannot fail a build any more: `/etc/timezone` is written first and `ln` is allowed to fail, so the Windows runners pass | test_the_hook_sets_the_clock_the_locale_and_the_keymap probes for symlink support instead of assuming a platform |
+| 60 | portability | a filesystem that refuses symlinks cannot fail a build any more: `/etc/timezone` is written first and `ln` is allowed to fail, so the Windows runners pass | test_the_hook_sets_the_clock_the_locale_and_the_keymap accepts a link or a copy, so it does not care which one the filesystem allowed |
 | 61 | testing | the generated hook is syntax-checked by `sh -n` for four feature combinations, so quoting and continuations are validated by a shell rather than by reading | test_the_hook_is_valid_shell_on_this_platform |
 ## What this round did not do
 
