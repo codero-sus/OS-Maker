@@ -18,7 +18,7 @@ ignore = ["E501", "RUF001", "RUF002", "RUF003", "RET504"]
 # the config lives here so `python3 -m mypy` / `python3 -m coverage` need no flags.
 [tool.mypy]
 python_version = "3.10"
-files = ["build_os.py", "os_maker.py", "os_builder.py", "os_builder_gui.py"]
+files = ["build_os.py", "os_maker.py", "os_builder.py", "os_builder_gui.py", "tools/style_sheet.py"]
 strict = true
 
 [[tool.mypy.overrides]]
