@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+  # lets a maintainer run the expensive real-ISO job against a branch on demand
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -114,7 +116,12 @@ jobs:
 
   native-build:
     name: Real ISO build (Docker)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # The expensive job: a full Debian live image, booted headless.  Runs on pushes to
+    # main, and on demand -- workflow_dispatch exists so a branch can be proven to build
+    # before it is merged.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     needs: test
     steps:
@@ -126,13 +133,73 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86
-      # One build only: --boot-test boots the finished ISO headless and fails the
-      # job unless the live system reaches its login prompt.
-      - name: Build a minimal live ISO and boot it
+      # One build only, and it goes through the recipe builder on purpose: that is the
+      # same code the GUI runs (validate -> branding -> argv -> build_os.py), so this job
+      # covers both programs at once.  --boot-test boots the finished ISO headless and
+      # fails unless the live system reaches its login prompt.
+      - name: Write the CI recipe
         run: |
-          python build_os.py --name "CI Minimal" --packages "linux-image-amd64,live-boot,sudo" \
-            --compression lz4 --cache-dir "${{ runner.temp }}/apt-cache" \
-            --output dist --boot-test --boot-timeout 420
+          cat > ci-recipe.json <<'JSON'
+          {
+            "name": "CI Minimal",
+            "tagline": "branded by the recipe builder",
+            "hostname": "ci-minimal",
+            "motd": "CI Minimal: branded by the recipe builder.\n",
+            "release": "trixie",
+            "architecture": "amd64",
+            "preset": "minimal",
+            "packages": ["linux-image-amd64", "live-boot", "sudo"],
+            "compression": "lz4",
+            "with_wallpaper": true,
+            "wallpaper_style": "rays",
+            "wallpaper_size": "800x450",
+            "accent": "#39d353",
+            "container": "auto",
+            "boot_test": true,
+            "boot_timeout": 420,
+            "output_dir": "dist",
+            "cache_dir": "${{ runner.temp }}/apt-cache"
+          }
+          JSON
+          python os_builder.py --check ci-recipe.json
+      - name: Build a branded live ISO and boot it
+        run: python os_builder.py --build ci-recipe.json
+      - name: Check the branding really landed inside the image
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends squashfs-tools
+          iso=$(ls dist/*.iso | head -1)
+          test -n "$iso"
+          dir=$(mktemp -d)
+          sudo mount -o loop,ro "$iso" "$dir"
+          squash=$(find "$dir" -maxdepth 3 -name filesystem.squashfs | head -1)
+          test -n "$squash"
+          # the whole rootfs, deliberately: -e means different things across
+          # squashfs-tools versions, and a minimal image costs seconds to unpack
+          sudo unsquashfs -no-progress -d "$dir/root" "$squash" > /dev/null
+          grep -q 'PRETTY_NAME="CI Minimal"' "$dir/root/etc/os-release"
+          grep -q '^ci-minimal$' "$dir/root/etc/hostname"
+          # the line the hook echoes into the build log is what proves live-build really
+          # ran it: /etc/hostname alone could have come from either mechanism
+          grep -q 'os-builder: branding installed' dist/*.iso.log
+          grep -q 'OS_MAKER_PRESET=minimal' "$dir/root/etc/os-release"
+          grep -q 'branded by the recipe builder' "$dir/root/etc/motd"
+          # read the wallpaper back with the builder's own PNG header reader, so a
+          # truncated file inside the image fails here rather than on a monitor
+          python - "$dir/root/usr/share/backgrounds/os-maker.png" <<'PY'
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, ".")
+          import os_builder
+
+          size = os_builder.read_png_size(Path(sys.argv[1]))
+          if size != (800, 450):
+              raise SystemExit(f"wallpaper inside the image is {size[0]}x{size[1]}, expected 800x450")
+          print(f"wallpaper in the image: {size[0]}x{size[1]} PNG, ok")
+          PY
+          sudo umount "$dir"
+          sudo rm -rf "$dir"
       - name: Record the image checksum in the job summary
         if: always()
         run: |
