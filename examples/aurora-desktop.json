@@ -26,6 +26,14 @@
   "output_dir": "",
   "work_dir": "",
   "cache_dir": "",
-  "notes": "Built as a demo of what OS Builder produces: a full desktop with three extra apps.",
-  "recipe_version": 1
+  "notes": "Built as a demo of what OS Builder produces: a full desktop with three extra apps. The locale, keyboard and clock lines are what the branding hook installs at build time.",
+  "recipe_version": 1,
+  "locale": "en_GB.UTF-8",
+  "keyboard": "gb",
+  "timezone": "Europe/London",
+  "picture_options": "zoomed",
+  "wallpaper_seed": 1985,
+  "version": "1.0",
+  "author": "OS Maker examples",
+  "home_url": "https://github.com/codero-sus/OS-Maker"
 }
