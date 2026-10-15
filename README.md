@@ -4,7 +4,7 @@ This repository holds three independent Python programs (no third-party dependen
 
 | File | What it does |
 | --- | --- |
-| [`os_builder.py`](os_builder.py) + [`os_builder_gui.py`](os_builder_gui.py) | A **graphical OS builder**: pick a name, a look, packages and files, press a button, get a bootable ISO. |
+| [`os_builder.py`](os_builder.py) + [`os_builder_gui.py`](os_builder_gui.py) | An **OS builder**: pick a name, a look, packages and files, press a button, get a bootable ISO — or run the same recipe headless from a terminal. |
 | [`build_os.py`](build_os.py) | Builds a **real bootable Debian-based live ISO** on Linux, macOS and Windows. |
 | [`os_maker.py`](os_maker.py) | A **mini operating-system simulator**: a shell and a persistent virtual filesystem that runs anywhere Python does. |
 
@@ -141,60 +141,92 @@ pipe too.
 
 ---
 
-## 3. `os_builder.py` — a graphical OS builder
+## 3. `os_builder.py` — an OS builder with a GUI and a headless CLI
 
 A window, a recipe, and a real ISO. `os_builder.py` is the design studio on top of
-`build_os.py`: you choose what the machine is called, what it looks like and what is in it, and
-it generates the artwork and runs the actual build.
+`build_os.py`: you choose what the machine is called, what it looks like, what is in it and
+how it behaves when it boots; it generates the artwork and runs the actual build. Every
+button has an equivalent flag, so the same recipe works over SSH, in CI, or in a container
+with no display.
 
 ```bash
 python3 os_builder.py                       # the GUI (needs Tk, see below)
 python3 os_builder.py --preset gaming       # start the GUI from a preset
 python3 os_builder.py -r examples/aurora-desktop.json
+python3 os_builder.py --gui-check           # can this machine show the GUI, and if not, why
 ```
 
-![the five wallpaper styles the builder can generate](docs/wallpaper-styles.png)
+![the eleven wallpaper styles the builder can generate](docs/wallpaper-styles.png)
 
-Those five wallpapers are the `gradient`, `sunset`, `rays`, `grid` and `waves` styles, each rendered by
-`os_builder.py` itself with `zlib` and `struct` — no Pillow, no templates, no image files to edit. To
-regenerate the banner:
+Those eleven wallpapers — `gradient`, `sunset`, `rays`, `grid`, `waves`, `aurora`, `mesh`,
+`dots`, `stripes`, `spiral` and `nebula` — are rendered by `os_builder.py` itself with `zlib`
+and `struct`: no Pillow, no templates, no image files to edit. `dots`, `mesh`, `nebula`,
+`aurora`, `spiral` and `waves` also take a `wallpaper_seed`, so the same style rolls a
+different picture; the same seed always draws the same one. The sheet above is generated,
+not pasted in, which is the only way it cannot lie about the output:
 
 ```bash
-for style in gradient sunset rays grid waves; do
-  python3 -c "import os_builder as ob; ob.render_wallpaper_png(
-      ob.Recipe(name='Neon Arcade', tagline='thirty years of games, one reboot',
-                wallpaper_style='$style', accent='#4f9cf9'),
-      '/tmp/$style.png', width=320, height=180)"
-done   # then tile the five files with any image tool
+python3 tools/style_sheet.py                # redraws docs/wallpaper-styles.png
 ```
 
 ### What you can set
 
 | Tab | Controls |
 | --- | --- |
-| identity | product name, tagline, hostname, `/etc/motd`, notes, Debian release/architecture/compression/container mode |
+| identity | product name, tagline, hostname, `/etc/motd`, notes, Debian release / architecture / compression / container mode |
 | software | preset, the effective package list, ~25 tickable suggestions, your own additions, firmware switch |
-| appearance | accent colour (7 swatches or any hex), five wallpaper styles, resolution, and a **live preview** that redraws as you type |
+| system | locale, console keyboard, timezone, kernel flavour (`auto`, `generic`, `cloud`, `realtime`, `none`), background fit, GRUB menu timeout, OS version / author / home URL, extra apt sources, packages to purge, the `/etc/os-maker.json` build record |
+| appearance | accent colour (7 swatches or any hex), eleven wallpaper styles, resolution, a seed, whether the name is stamped on the image, whether `/etc/motd` gets the banner, and a **live preview** that redraws as you type |
 | files & hooks | files copied to a path inside the image, shell hooks live-build runs while building |
-| build | output/work/cache folders, QEMU boot test and how long to wait for it, keep-workspace, skip-checks, and a table of what the build produced with SHA-256 verification |
+| build | output/work/cache folders, QEMU boot test and how long to wait, keep-workspace, skip-checks, and a table of what the build produced with SHA-256 verification |
 
-The window adopts the accent colour of the OS you are building, so a "Neon Arcade" recipe really
-does look like one. A live log pane shows the builder's output (colour-coded, auto-scrolling,
-`Stop` available), and a dry run button prints the exact `build_os.py` command line before
-committing to a build.
+The window adopts the accent colour of the OS you are building, so a "Neon Arcade" recipe
+really does look like one. A live log pane shows the builder's output (colour-coded,
+auto-scrolling, `Stop` available), and a dry run prints the exact `build_os.py` command line
+before committing to a build. `F1` lists the shortcuts; `Alt-1`…`Alt-6` jump between tabs,
+`Ctrl-E` shows the build command, `Escape` stops a build.
 
-### Recipes
-
-A recipe is plain JSON, so it can be reviewed, versioned and reproduced without the GUI:
+### The same thing from a terminal
 
 ```bash
 python3 os_builder.py --new --out my-os.json --preset server   # write a starter recipe
 python3 os_builder.py --check my-os.json                        # validate it (exit 0 = buildable)
-python3 os_builder.py --preview my-os.json                       # argv + the builder's dry-run plan
-python3 os_builder.py --build my-os.json                         # build it with no GUI at all
-python3 os_builder.py --wallpaper my-os.json --out wp.png        # just the generated artwork
-python3 os_builder.py --list-presets
+python3 os_builder.py --preview my-os.json                      # argv + the builder's dry-run plan
+python3 os_builder.py --build my-os.json                        # build it with no GUI at all
+python3 os_builder.py --wallpaper my-os.json --out wp.png       # just the generated artwork
+python3 os_builder.py --list-presets                            # eleven starting points
+python3 os_builder.py --preset-info rescue                      # one preset in full
+python3 os_builder.py --explain                                 # what every recipe field turns into
 ```
+
+For scripts and CI:
+
+```bash
+python3 os_builder.py --check my-os.json --json       # one JSON object: digest, problems, argv
+python3 os_builder.py --build my-os.json --json --quiet --tail 40
+python3 os_builder.py --build my-os.json --stall-notice 300
+python3 os_builder.py --fix my-os.json --out tidy.json
+python3 os_builder.py --diff release-candidate.json nightly.json
+python3 os_builder.py --batch examples/
+```
+
+`--fix` tidies what a hand edit always drifts into — stray spaces, `#4F9CF9` in upper case,
+`1280X720`, duplicated packages, a `hostname` that repeats what the name already implies —
+prints every change, and only writes a file if you pass `--out`. `--diff` exits 1 when two
+recipes differ, which makes "did this commit change the image?" a one-line CI check.
+`--batch` checks a whole folder and returns the worst exit code. `--tail N` is the
+compromise for a quiet build: the log stays hidden, but the last N lines are repeated when it
+fails, next to a hint if the failure is one the builder recognises.
+
+A build server can set the plumbing once instead of editing every recipe:
+`OS_BUILDER_OUTPUT`, `OS_BUILDER_WORK`, `OS_BUILDER_CACHE`, `OS_BUILDER_CONTAINER` and
+`OS_BUILDER_TIMEOUT` are applied to any field the recipe leaves blank, in the GUI and in the
+CLI alike.
+
+### A recipe is JSON
+
+A recipe is a plain JSON file, so it can be reviewed, versioned and reproduced without ever
+opening the GUI:
 
 ```json
 {
@@ -202,30 +234,47 @@ python3 os_builder.py --list-presets
   "tagline": "thirty years of games, one reboot",
   "preset": "gaming",
   "packages": ["fceux", "mame-tools"],
+  "remove_packages": ["bluetooth"],
   "accent": "#bc8cff",
   "wallpaper_style": "rays",
-  "with_firmware": true,
+  "wallpaper_seed": 1985,
+  "locale": "en_GB.UTF-8",
+  "keyboard": "gb",
+  "timezone": "Europe/London",
+  "kernel": "generic",
+  "version": "1.0",
+  "author": "Ada",
+  "home_url": "https://example.org/neon-arcade",
+  "grub_timeout": 0,
+  "motd_art": true,
+  "with_branding_record": true,
   "boot_test": true,
   "boot_timeout": 420,
   "files": ["banner.txt:/etc/issue.net"]
 }
 ```
 
-Three ready-made recipes live in [`examples/`](examples) and CI checks all of them. Relative paths in
-`files` resolve against the recipe's own folder, so an example stays portable.
+Three ready-made recipes live in [`examples/`](examples) and CI checks all of them
+(`--batch examples/`). Relative paths in `files` resolve against the recipe's own folder, so
+an example stays portable. Every field is optional: the loader rejects a *type* it cannot use
+and names the field, and `--explain` prints what each one turns into.
 
 ### How it is put together
 
 The GUI never reimplements the build. `RecipeModel` holds the state, `make_branding()` generates the
-wallpaper plus `/etc/motd`, `/etc/issue` and `/etc/os-release` (which travel as ordinary `--copy`
-entries) and a live-build hook for the two things a file copy cannot do — set `/etc/hostname` and
-register the wallpaper with GNOME's dconf and XFCE's XML profile, so the branding is actually shown
-rather than merely present — and `BuildRun` runs `build_os.py` as a subprocess with the flags the
-recipe describes, which is exactly what `--build` does from a terminal. That means:
+wallpaper plus `/etc/motd`, `/etc/issue`, `/etc/issue.net`, `/etc/os-release` and `/etc/os-maker.json`
+(which travel as ordinary `--copy` entries) and one live-build `chroot` hook for everything a file copy
+cannot do — set `/etc/hostname`, generate the locale and console keymap, point `/etc/localtime`, trim
+`GRUB_TIMEOUT`, drop extra apt sources, purge the packages you asked to lose, and register the wallpaper
+with GNOME's dconf and XFCE's XML profile so the branding is actually *shown* rather than merely present
+— and `BuildRun` runs `build_os.py` as a subprocess with the flags the recipe describes, which is exactly
+what `--build` does from a terminal. That means:
 
 * the same recipe works headless, in CI and over SSH, where there is no display;
 * `build_os.py` keeps a single supported entry point, so nothing can drift between the two;
-* the GUI is a thin view: 93% of it is covered by tests that run without Tk, using a small fake
+* the hook is *executed* by the tests, against a fake rootfs and a fake `apt-get`, so its shell syntax
+  and its effects are proven rather than eyeballed;
+* the GUI is a thin view: 94% of it is covered by tests that run without Tk, using a small fake
   `tkinter`. Progress comes from live-build's own stage markers and apt's percentages, so the bar
   means something rather than spinning.
 
@@ -238,8 +287,8 @@ points at `--preview` / `--build`, which need nothing extra.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests -t .      # 406 tests, stdlib only, no Docker/network needed
-python3 -m compileall -q build_os.py os_maker.py os_builder.py os_builder_gui.py
+python3 -m unittest discover -s tests -t .      # 463 tests, stdlib only, no Docker/network needed
+python3 -m compileall -q build_os.py os_maker.py os_builder.py os_builder_gui.py tools/style_sheet.py
 
 pip install ruff mypy "coverage[toml]"           # the three gates CI also runs
 ruff check . && ruff format --check .
@@ -248,8 +297,9 @@ python3 -m coverage run -m unittest discover -s tests -t . && python3 -m coverag
 ```
 
 The four programs are deliberately layered: `os_builder_gui.py` only draws widgets and
-`os_builder.py` holds every decision (recipe, validation, branding, argv, progress) so the GUI is
-testable without a display; `RecipeModel` is the whole application.
+`os_builder.py` holds every decision (recipe, validation, branding, argv, progress, the recipe tools) so the GUI is
+testable without a display; `RecipeModel` is the whole application. `tools/style_sheet.py` is the one non-script:
+it exists so the README image is generated by the code it documents.
 
 `os_maker.py` is layered on purpose: `lex`/`parse` for the command line, `FileSystem` for the node tree and the
 save file, `TinyOS` for the shell (expansion, dispatch, history), then readline and the CLI. `build_os.py` decides
@@ -258,8 +308,12 @@ flag never survives to minute twenty of a build.
 
 The suite covers the shell's lexer, path handling and every built-in (including the error text each command gives
 on bad input), plus the builder's validation, engine probing, command assembly, staging tree and — through a stub
-`lb` — the complete build → ISO → checksum → log pipeline and the QEMU boot test. Branch coverage is 96%
-(`build_os.py` 99%, `os_builder.py` 97%, `os_builder_gui.py` 93%, `os_maker.py` 95%).
+`lb` — the complete build → ISO → checksum → log pipeline and the QEMU boot test. Branch coverage is 95%
+(`build_os.py` 99%, `os_builder.py` 95%, `os_builder_gui.py` 94%, `os_maker.py` 95%); CI fails the build below 90%,
+so the number is a ratchet rather than a boast.
+
+[`IMPROVEMENTS.md`](IMPROVEMENTS.md) is the ledger of what changed and which test proves each line — one row per
+real behaviour, nothing counted twice, and an explicit list of what remains unverified.
 
 CI (`.github/workflows/ci.yml`) runs four gates: ruff lint + format, `mypy --strict`, the tests on
 Linux/macOS/Windows for Python 3.10 and 3.12, and a coverage job that fails below 90% so the number can only go
